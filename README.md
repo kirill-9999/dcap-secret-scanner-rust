@@ -21,7 +21,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release
 ## Использование
 
 ```text
-dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [-v] [--presidio]
+dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [--state <файл>] [-v] [--presidio]
 ```
 
 Примеры:
@@ -29,9 +29,29 @@ dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff
 ```powershell
 .\target\release\dcap-scan.exe "Z:\test_files" "e:\Temp\logs" 10
 .\target\release\dcap-scan.exe "C:\src" .\out.log 8 --no-sniff
+.\target\release\dcap-scan.exe "C:\src" .\out.log 8 --state .\state.tsv
 ```
 
 Код возврата: `0` = чисто, `1` = ошибка, `2` = найдены секреты.
+
+## Лог-отчёт
+
+В лог **не записываются сами значения секретов** — только пути и типы:
+
+```text
+[ФАЙЛЫ С НАХОДКАМИ]
+  D:\test_files\config.py
+    CRED_API_KEY, CRED_PASSWORD
+[НЕ УДАЛОСЬ ОБРАБОТАТЬ]
+  D:\test_files\broken.docx :: не удалось извлечь текст (...)
+```
+
+## State (возобновление после прерывания)
+
+`--state <файл>` сохраняет выполненную работу в отдельный файл. При повторном
+запуске с тем же файлом уже обработанные файлы пропускаются, а отчёт собирается
+из старых и новых данных. Секреты в state тоже не попадают (только пути, типы и
+причины ошибок). Для другого `# folder:` state автоматически сбрасывается.
 
 ## Docker: сканирование сетевого диска (Z: / SMB-шары)
 
@@ -77,6 +97,27 @@ docker run --rm --privileged `
 docker run --rm -v "D:\local\data:/data" dcap-scan /data /out.log 8
 ```
 
+### Docker Compose (рекомендуется для SMB)
+
+1. Создайте `docker-compose.yml` (готов) и настроение окружения:
+   ```powershell
+   Copy-Item .env.example .env
+   # заполните SMB_SHARE, SMB_USER и пароль (SMB_PASS или secrets/password.txt)
+   ```
+2. Запуск SMB-сканирования:
+   ```powershell
+   docker compose up --build
+   ```
+3. Сканирование локальной bind-mounted папки (без SMB):
+   ```powershell
+   docker compose run --rm -v "D:\local\data:/data" dcap-scan /data /logs 10
+   ```
+
+- `SMB_MOUNT` из `.env` меняет точку монтирования (по умолч. `/mnt/share`); команда сканера по умолчанию — `/mnt/share /logs 10`.
+- Отчёты пишутся в `./logs`, пароль — `./secrets/password.txt` (папки в `.gitignore`).
+- Лучше не оставлять пароль в `.env` на общем диске — используйте файл `secrets/password.txt`.
+- Корректное завершение — после `docker compose up` Ctrl+C, либо `--rm` у `run` убирает контейнер.
+
 ## Переменные окружения (entrypoint)
 
 | Переменная     | Назначение                                        |
@@ -85,7 +126,7 @@ docker run --rm -v "D:\local\data:/data" dcap-scan /data /out.log 8
 | `SMB_USER`     | пользователь (`mynas\user`)                       |
 | `SMB_PASS`     | пароль (альтернатива файлу)                       |
 | `SMB_PASS_FILE`| путь в контейнере к файлу с паролем               |
-| `SMB_MOUNT`    | точка монтирования (по умолч. `/mnt/share`)       |
+| `SMB_MOUNT`    | точка монтирования (по умолч. `/mnt/share`)         |
 | `SMB_OPTS`     | доп. опции cifs, напр. `,vers=3.0,noperm,cache=none` |
 
 ## Проверено (10 потоков, сетевой диск Z:)

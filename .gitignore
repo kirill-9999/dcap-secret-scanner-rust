@@ -2,6 +2,7 @@
 target/
 rustscanner/target/
 *.log
+logs/
 
 # Секреты — НИКОГДА не коммитить
 *.pem
@@ -9,6 +10,8 @@ rustscanner/target/
 *.env
 .env
 .env.*
+!.env.example
+secrets/
 SMB_PASS_FILE
 
 # IDE / ОС

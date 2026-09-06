@@ -4,14 +4,14 @@
 //   dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [-v] [--encoding utf-8] [--presidio]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use regex::Regex;
 
 // ---------------------------------------------------------------------------
@@ -338,16 +338,19 @@ fn decode_to_text(raw: &[u8]) -> String {
     }
 }
 
-fn read_file_text(path: &Path, encoding: &str, sniff: bool) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+fn read_file_text(path: &Path, encoding: &str, sniff: bool) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("не удалось получить метаданные: {e}"))?;
     if sniff && meta.len() > MAX_FILE_SIZE {
-        return None;
+        return Err(format!(
+            "файл превышает лимит размера ({} МБ)",
+            MAX_FILE_SIZE / 1024 / 1024
+        ));
     }
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("не удалось открыть файл: {e}"))?;
     let mut raw = Vec::with_capacity(meta.len() as usize);
-    if f.read_to_end(&mut raw).is_err() {
-        return None;
-    }
+    f.read_to_end(&mut raw)
+        .map_err(|e| format!("ошибка чтения файла: {e}"))?;
     let text = match encoding {
         "cp1251" | "windows-1251" => {
             let (cow, _, _) = encoding_rs::WINDOWS_1251.decode(&raw);
@@ -355,7 +358,7 @@ fn read_file_text(path: &Path, encoding: &str, sniff: bool) -> Option<String> {
         }
         _ => decode_to_text(&raw),
     };
-    Some(take_first_chars(&text, MAX_TEXT_SIZE))
+    Ok(take_first_chars(&text, MAX_TEXT_SIZE))
 }
 
 fn strip_office_tags(xml: &str) -> String {
@@ -484,26 +487,35 @@ fn collapse_newlines(s: &str) -> String {
     re.replace_all(s, "\n").into_owned()
 }
 
-fn extract_office_text(path: &Path) -> Option<String> {
+fn extract_office_text(path: &Path) -> Result<String, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = std::fs::metadata(path).map_err(|e| format!("не удалось получить метаданные: {e}"))?;
     if meta.len() > MAX_FILE_SIZE {
-        return None;
+        return Err(format!(
+            "файл превышает лимит размера ({} МБ)",
+            MAX_FILE_SIZE / 1024 / 1024
+        ));
     }
-    let data = std::fs::read(path).ok()?;
+    let data = std::fs::read(path).map_err(|e| format!("ошибка чтения файла: {e}"))?;
     match ext.as_str() {
-        "docx" => extract_docx(&data),
-        "xlsx" => extract_xlsx(&data),
-        "doc" | "xls" => extract_ole_strings(&data),
-        _ => None,
+        "docx" => extract_docx(&data).ok_or_else(|| {
+            "не удалось извлечь текст (повреждённый или не поддерживаемый docx-файл)".to_string()
+        }),
+        "xlsx" => extract_xlsx(&data).ok_or_else(|| {
+            "не удалось извлечь текст (повреждённый или не поддерживаемый xlsx-файл)".to_string()
+        }),
+        "doc" | "xls" => extract_ole_strings(&data).ok_or_else(|| {
+            "не удалось извлечь текст (повреждённый или не поддерживаемый OLE-файл)".to_string()
+        }),
+        _ => Err("неподдерживаемый формат".to_string()),
     }
 }
 
-fn read_file_text_or_office(path: &Path, encoding: &str, sniff: bool) -> Option<String> {
+fn read_file_text_or_office(path: &Path, encoding: &str, sniff: bool) -> Result<String, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -540,21 +552,191 @@ struct Shared {
     by_subcategory: HashMap<String, usize>,
     seen_keys: HashSet<String>,
     flagged_files: Vec<String>,
+    file_types: HashMap<String, HashSet<String>>,
+    failures: Vec<(String, String)>,
     findings: Vec<Finding>,
 }
 
-impl Shared {
-    fn clone_inner(&self) -> Shared {
-        Shared {
-            files_scanned: self.files_scanned,
-            files_skipped: self.files_skipped,
-            files_error: self.files_error,
-            find_count: self.find_count,
-            by_subcategory: self.by_subcategory.clone(),
-            seen_keys: HashSet::new(),
-            flagged_files: Vec::new(),
-            findings: Vec::new(),
+// ---------------------------------------------------------------------------
+// State (persistence выполненной работы для возобновления)
+// ---------------------------------------------------------------------------
+
+/// События, которые воркеры отправляют в поток записи state-файла.
+/// Секреты (значения) здесь никогда не пишутся — только пути и подкатегории.
+#[derive(Debug)]
+enum StateEvent {
+    Processed(String),
+    Finding(String, String),
+    Failed(String, String),
+}
+
+#[derive(Clone, Default)]
+struct StateSeed {
+    processed: HashSet<String>,
+    findings: Vec<(String, String)>,
+    failures: Vec<(String, String)>,
+}
+
+/// Читает state-файл. Если папка в заголовке не совпадает с текущей —
+/// начинаем с нуля (seed без данных).
+fn load_state(path: &Path, folder: &str) -> StateSeed {
+    let mut seed = StateSeed::default();
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return seed;
+    };
+    let mut folder_ok = false;
+    for line in content.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(f) = line.strip_prefix("# folder: ") {
+            folder_ok = f.trim() == folder;
+            continue;
         }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        match parts.next() {
+            Some("P") => {
+                if let Some(p) = parts.next() {
+                    if !p.is_empty() {
+                        seed.processed.insert(p.to_string());
+                    }
+                }
+            }
+            Some("F") => {
+                let p = parts.next().unwrap_or_default().to_string();
+                let s = parts.next().unwrap_or_default().to_string();
+                if !p.is_empty() && !s.is_empty() {
+                    seed.findings.push((p, s));
+                }
+            }
+            Some("E") => {
+                let p = parts.next().unwrap_or_default().to_string();
+                let r = parts.next().unwrap_or_default().to_string();
+                if !p.is_empty() {
+                    seed.failures.push((p.clone(), r));
+                    seed.processed.insert(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Грязный state от другой папки не используем.
+    if !folder_ok {
+        return StateSeed::default();
+    }
+    // Если файл не был доведён до конца (нет P/E-маркера), его находки
+    // могли записаться лишь частично — отбрасываем их, чтобы не задвоить
+    // при повторном сканировании этого файла.
+    seed.findings.retain(|(p, _)| seed.processed.contains(p));
+    seed
+}
+
+/// Формирует начальное состояние из сохранённого (восстанавливает прежние
+/// находки и ошибки, чтобы итоговый отчёт был полным после возобновления).
+fn seed_of(seed: &StateSeed) -> Shared {
+    let mut s = Shared::default();
+    for (p, sub) in &seed.findings {
+        s.find_count += 1;
+        *s.by_subcategory.entry(sub.clone()).or_insert(0) += 1;
+        s.file_types.entry(p.clone()).or_default().insert(sub.clone());
+        if !s.flagged_files.contains(p) {
+            s.flagged_files.push(p.clone());
+        }
+    }
+    s.failures = seed.failures.clone();
+    s
+}
+
+/// Поток-писатель state-файла: переписывает заголовок + сохранённые данные,
+/// потом дописывает новые события.
+#[allow(clippy::type_complexity)]
+fn spawn_state_writer(
+    path: &Path,
+    folder: &str,
+    seed: &StateSeed,
+    rx: Receiver<StateEvent>,
+) -> std::thread::JoinHandle<()> {
+    let f = std::fs::File::create(path).expect("не удалось создать state-файл");
+    let mut w = BufWriter::new(f);
+    let _ = writeln!(w, "# dcap-scan-state v1");
+    let _ = writeln!(w, "# folder: {}", folder);
+    let _ = writeln!(w, "# started: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    for p in &seed.processed {
+        let _ = writeln!(w, "P\t{}", p);
+    }
+    for (p, s) in &seed.findings {
+        let _ = writeln!(w, "F\t{}\t{}", p, s);
+    }
+    for (p, r) in &seed.failures {
+        let _ = writeln!(w, "E\t{}\t{}", p, r);
+    }
+    std::thread::spawn(move || {
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                StateEvent::Processed(p) => {
+                    let _ = writeln!(w, "P\t{}", p);
+                }
+                StateEvent::Finding(p, s) => {
+                    let _ = writeln!(w, "F\t{}\t{}", p, s);
+                }
+                StateEvent::Failed(p, r) => {
+                    let _ = writeln!(w, "E\t{}\t{}", p, r);
+                }
+            }
+            let _ = w.flush();
+        }
+        let _ = w.flush();
+    })
+}
+
+/// Пишет итоговый отчёт в лог-файл: файлы с находками + типы секретов
+/// (без значений!) и файлы, которые не удалось обработать + причина.
+fn write_report(
+    log_path: &Path,
+    folder: &Path,
+    shared: &Shared,
+    threads: usize,
+    resumed: usize,
+) {
+    let mut out = String::new();
+    out.push_str("# dcap-secret-scanner — отчёт\n");
+    out.push_str(&format!("# Папка:       {}\n", folder.display()));
+    out.push_str(&format!("# Дата:        {}\n", Local::now().format("%Y-%m-%d %H:%M:%S")));
+    out.push_str(&format!("# Потоков:     {}\n", threads));
+    out.push_str(&format!(
+        "# Файлов:      {} скан | {} пропуск | {} ошибок | {} возобновлено\n",
+        shared.files_scanned, shared.files_skipped, shared.files_error, resumed
+    ));
+    out.push_str(&format!("# Находок:     {}\n", shared.find_count));
+    out.push('\n');
+
+    out.push_str("[ФАЙЛЫ С НАХОДКАМИ]\n");
+    if shared.file_types.is_empty() {
+        out.push_str("  (нет)\n");
+    } else {
+        let mut files: Vec<&String> = shared.file_types.keys().collect();
+        files.sort();
+        for f in files {
+            out.push_str(&format!("  {}\n", f));
+            let mut types: Vec<String> = shared.file_types[f].iter().map(|s| s.to_string()).collect();
+            types.sort();
+            out.push_str(&format!("    {}\n", types.join(", ")));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("[НЕ УДАЛОСЬ ОБРАБОТАТЬ]\n");
+    if shared.failures.is_empty() {
+        out.push_str("  (нет)\n");
+    } else {
+        for (p, r) in &shared.failures {
+            out.push_str(&format!("  {} :: {}\n", p, r));
+        }
+    }
+
+    if let Ok(mut f) = std::fs::File::create(log_path) {
+        let _ = f.write_all(out.as_bytes());
     }
 }
 
@@ -571,6 +753,8 @@ struct WalkState {
 struct ScanOut {
     files_scanned: usize,
     files_skipped: usize,
+    files_error: usize,
+    resumed: usize,
     find_count: usize,
     by_subcategory: HashMap<String, usize>,
 }
@@ -582,9 +766,19 @@ fn run_scan(
     sniff: bool,
     verbose: bool,
     threads: usize,
+    state_path: Option<&Path>,
 ) -> ScanOut {
     let rules = Arc::new(build_rules());
     let prefilter = Arc::new(build_prefilter(&rules));
+
+    // State: загрузка предыдущей работы (если задан --state)
+    let canonical_folder = folder.to_string_lossy().into_owned();
+    let seed = match state_path {
+        Some(sp) => load_state(sp, &canonical_folder),
+        None => StateSeed::default(),
+    };
+    let resume_processed = Arc::new(seed.processed.clone());
+    let resumed = Arc::new(AtomicUsize::new(0));
 
     let state = Arc::new((Mutex::new(WalkState {
         q: VecDeque::from([folder.to_path_buf()]),
@@ -598,9 +792,19 @@ fn run_scan(
     let produced = Arc::new(AtomicUsize::new(0));
     let total_subdirs = Arc::new(AtomicUsize::new(0));
     let skipped_walk = Arc::new(AtomicUsize::new(0));
-    let shared = Arc::new(Mutex::new(Shared::default()));
+    let shared = Arc::new(Mutex::new(seed_of(&seed)));
     let processed = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
+
+    // Канал событий для state-файла + поток-писатель
+    let (state_tx, state_writer_handle): (Option<Sender<StateEvent>>, Option<_>) = match state_path {
+        Some(sp) => {
+            let (tx, rx) = unbounded();
+            let handle = spawn_state_writer(sp, &canonical_folder, &seed, rx);
+            (Some(tx), Some(handle))
+        }
+        None => (None, None),
+    };
 
     // Воркеры каталогов
     let mut dir_handles = Vec::new();
@@ -610,6 +814,8 @@ fn run_scan(
         let produced = produced.clone();
         let total_subdirs = total_subdirs.clone();
         let skipped_walk = skipped_walk.clone();
+        let resume_processed = resume_processed.clone();
+        let resumed = resumed.clone();
         let sniff = sniff;
         dir_handles.push(std::thread::spawn(move || {
             loop {
@@ -657,6 +863,12 @@ fn run_scan(
                                 skipped_walk.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
+                            // Пропускаем уже обработанные при возобновлении
+                            let pstr = path.to_string_lossy().into_owned();
+                            if !resume_processed.is_empty() && resume_processed.contains(&pstr) {
+                                resumed.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             produced.fetch_add(1, Ordering::Relaxed);
                             if file_tx.send(Some(path)).is_err() {
                                 break;
@@ -691,22 +903,22 @@ fn run_scan(
         let prefilter = prefilter.clone();
         let shared = shared.clone();
         let processed = processed.clone();
-        let log_path = log_path.to_path_buf();
         let encoding = encoding.to_string();
         let sniff = sniff;
         let verbose = verbose;
+        let state_tx = state_tx.clone();
         work_handles.push(std::thread::spawn(move || {
             while let Ok(item) = file_rx.recv() {
                 let Some(path) = item else { break };
                 process_file(
                     &path,
-                    &log_path,
                     &encoding,
                     sniff,
                     verbose,
                     &rules,
                     &prefilter,
                     &shared,
+                    state_tx.as_ref(),
                 );
                 processed.fetch_add(1, Ordering::Relaxed);
             }
@@ -752,11 +964,18 @@ fn run_scan(
         let _ = h.join();
     }
 
+    // Закрываем канал state-событий и ждём, пока писатель допишет файл
+    drop(state_tx);
+    if let Some(h) = state_writer_handle {
+        let _ = h.join();
+    }
+
     progress_done.store(true, Ordering::Relaxed);
 
     let elapsed = start.elapsed().as_secs_f64();
     let produced_n = produced.load(Ordering::Relaxed);
     let subdirs_n = total_subdirs.load(Ordering::Relaxed);
+    let resumed_n = resumed.load(Ordering::Relaxed);
 
     {
         let mut shared_guard = shared.lock().unwrap();
@@ -766,24 +985,31 @@ fn run_scan(
     println!("[i] Файлов к обработке: {produced_n}, подпапок: {subdirs_n}");
     println!("[i] Время: {elapsed:.1} сек");
 
-    let final_shared = shared.lock().unwrap().clone_inner();
-    ScanOut {
-        files_scanned: final_shared.files_scanned,
-        files_skipped: final_shared.files_skipped,
-        find_count: final_shared.find_count,
-        by_subcategory: final_shared.by_subcategory,
-    }
+    let out = {
+        let g = shared.lock().unwrap();
+        let out = ScanOut {
+            files_scanned: g.files_scanned,
+            files_skipped: g.files_skipped,
+            files_error: g.files_error,
+            resumed: resumed_n,
+            find_count: g.find_count,
+            by_subcategory: g.by_subcategory.clone(),
+        };
+        write_report(log_path, folder, &g, threads, resumed_n);
+        out
+    };
+    out
 }
 
 fn process_file(
     path: &Path,
-    log_path: &Path,
     encoding: &str,
     sniff: bool,
     verbose: bool,
     rules: &[Rule],
     prefilter: &Regex,
     shared: &Mutex<Shared>,
+    state_tx: Option<&Sender<StateEvent>>,
 ) {
     let path_str = path.to_string_lossy().into_owned();
     let hint = is_credential_file(path);
@@ -795,21 +1021,25 @@ fn process_file(
         add_finding(
             shared,
             path_str.clone(),
-            log_path,
             sub.to_string(),
             value,
             0,
             0.90,
             path_str.clone(),
             "filename".to_string(),
+            state_tx,
         );
     }
 
     let text = match read_file_text_or_office(path, encoding, sniff) {
-        Some(t) => t,
-        None => {
+        Ok(t) => t,
+        Err(reason) => {
             let mut s = shared.lock().unwrap();
-            s.files_skipped += 1;
+            s.files_error += 1;
+            s.failures.push((path_str.clone(), reason.clone()));
+            if let Some(tx) = state_tx {
+                let _ = tx.send(StateEvent::Failed(path_str.clone(), reason));
+            }
             return;
         }
     };
@@ -819,27 +1049,23 @@ fn process_file(
         s.files_scanned += 1;
     }
 
-    scan_text(
-        &path_str,
-        log_path,
-        &text,
-        rules,
-        prefilter,
-        shared,
-        verbose,
-    );
+    scan_text(&path_str, &text, rules, prefilter, shared, verbose, state_tx);
+
+    if let Some(tx) = state_tx {
+        let _ = tx.send(StateEvent::Processed(path_str.clone()));
+    }
 }
 
 fn add_finding(
     shared: &Mutex<Shared>,
     path: String,
-    log_path: &Path,
     subcategory: String,
     value: String,
     line_number: usize,
     confidence: f64,
     context: String,
-    method: String,
+    _method: String,
+    state_tx: Option<&Sender<StateEvent>>,
 ) {
     let key_bytes = take_first_chars(&value, 100);
     let key = format!("{path}:{subcategory}:{key_bytes}");
@@ -853,35 +1079,30 @@ fn add_finding(
     let is_new_file = !s.flagged_files.contains(&path);
     if is_new_file {
         s.flagged_files.push(path.clone());
-        // Запись пути в лог
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .and_then(|mut f| {
-                f.write_all(path.as_bytes())?;
-                f.write_all(b"\n")
-            });
     }
-    let _ = method;
+    s.file_types.entry(path.clone()).or_default().insert(subcategory.clone());
     s.findings.push(Finding {
-        path,
-        subcategory,
+        path: path.clone(),
+        subcategory: subcategory.clone(),
         value: take_first_chars(&value, 500),
         line_number,
         confidence,
         context: take_first_chars(&context, 500),
     });
+    drop(s);
+    if let Some(tx) = state_tx {
+        let _ = tx.send(StateEvent::Finding(path, subcategory));
+    }
 }
 
 fn scan_text(
     path: &str,
-    log_path: &Path,
     text: &str,
     rules: &[Rule],
     prefilter: &Regex,
     shared: &Mutex<Shared>,
     _verbose: bool,
+    state_tx: Option<&Sender<StateEvent>>,
 ) {
     if prefilter.find(text).is_none() {
         return;
@@ -905,13 +1126,13 @@ fn scan_text(
             add_finding(
                 shared,
                 path.to_string(),
-                log_path,
                 rule.subcategory.to_string(),
                 value.to_string(),
                 line_num,
                 rule.confidence,
                 ctx,
                 "regex".to_string(),
+                state_tx,
             );
         }
     }
@@ -928,11 +1149,12 @@ struct Args {
     encoding: String,
     sniff: bool,
     verbose: bool,
+    state: Option<PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "Использование: dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [-v] [--presidio]"
+        "Использование: dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [--state <файл>] [-v] [--presidio]"
     );
     std::process::exit(1);
 }
@@ -943,6 +1165,7 @@ fn parse_args() -> Args {
     let mut sniff = true;
     let mut verbose = false;
     let mut encoding = "utf-8".to_string();
+    let mut state: Option<PathBuf> = None;
     let mut threads_arg: Option<String> = None;
 
     while let Some(a) = it.next() {
@@ -954,6 +1177,10 @@ fn parse_args() -> Args {
                     "[i] Presidio не поддерживается в Rust-версии, работает regex-режим"
                 );
             }
+            "--state" => match it.next() {
+                Some(v) => state = Some(PathBuf::from(v)),
+                None => usage(),
+            },
             "--encoding" => match it.next() {
                 Some(v) => encoding = v,
                 None => usage(),
@@ -982,6 +1209,7 @@ fn parse_args() -> Args {
         encoding,
         sniff,
         verbose,
+        state,
     }
 }
 
@@ -1054,6 +1282,9 @@ fn main() {
         "[i] Sniff файлов без расширения: {}",
         if args.sniff { "вкл" } else { "выкл" }
     );
+    if let Some(sp) = &args.state {
+        println!("[i] State: {}", sp.display());
+    }
 
     // Лог открываем/очищаем заранее
     if let Ok(f) = std::fs::File::create(&log_path) {
@@ -1067,6 +1298,7 @@ fn main() {
         args.sniff,
         args.verbose,
         args.threads,
+        args.state.as_deref(),
     );
 
     println!();
@@ -1074,8 +1306,8 @@ fn main() {
     println!("  Сканирование завершено");
     println!("  Папка:     {}", folder.display());
     println!(
-        "  Файлов:    {} скан | {} пропуск | {} ошибки",
-        out.files_scanned, out.files_skipped, 0,
+        "  Файлов:    {} скан | {} пропуск | {} ошибок | {} возобновлено",
+        out.files_scanned, out.files_skipped, out.files_error, out.resumed,
     );
     println!("  Находок:   {}", out.find_count);
     if !out.by_subcategory.is_empty() {

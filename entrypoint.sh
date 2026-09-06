@@ -16,7 +16,7 @@
 
 set -e
 
-MOUNT="/mnt/share"
+MOUNT="${SMB_MOUNT:-/mnt/share}"
 
 if [ -n "$SMB_SHARE" ]; then
     echo "[entrypoint] Mounting SMB share $SMB_SHARE -> $MOUNT"
@@ -39,7 +39,7 @@ if [ -n "$SMB_SHARE" ]; then
     if [ "$T" = "." ] || [ "$T" = "/" ]; then
         T="$MOUNT"
     fi
-    shift 2>/dev/null || true
+    [ "$#" -ge 1 ] && shift
     echo "[entrypoint] Scanning $T"
     exec /usr/local/bin/dcap-scan "$T" "$@"
 fi

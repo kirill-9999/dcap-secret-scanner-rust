@@ -1,0 +1,27 @@
+# dcap-secret-scanner: сканирование SMB-шары (или локальной папки) в контейнере.
+#
+# Режимы:
+#   1. SMB: заполнить SMB_SHARE/SMB_USER и пароль в .env (см. .env.example),
+#      `docker compose up`  ->  маунтит шару сам (mount.cifs, нужен privileged).
+#   2. Bind (без SMB): оставить SMB_SHARE пустым и передать путь/команду явно:
+#      docker compose run --rm dcap-scan /data /out.log 10 -v D:\local\data:/data
+#
+# Логи: ./logs, пароль: ./secrets/password.txt (или SMB_PASS в .env).
+
+services:
+  dcap-scan:
+    image: dcap-scan
+    build:
+      context: .
+    privileged: true
+    environment:
+      SMB_SHARE: ${SMB_SHARE:-}
+      SMB_USER: ${SMB_USER:-}
+      SMB_PASS: ${SMB_PASS:-}
+      SMB_PASS_FILE: ${SMB_PASS_FILE:-/secrets/password.txt}
+      SMB_OPTS: ${SMB_OPTS:-,vers=3.0,noperm,cache=none}
+      SMB_MOUNT: ${SMB_MOUNT:-/mnt/share}
+    volumes:
+      - ./logs:/logs
+      - ./secrets:/secrets:ro
+    command: ["/mnt/share", "/logs", "10"]
