@@ -1,0 +1,21 @@
+[package]
+name = "dcap-secret-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "Сканер папок на наличие паролей и SSH-ключей (аналог scan_folder.py)"
+license = "MIT"
+
+[[bin]]
+name = "dcap-scan"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+encoding_rs = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+crossbeam-channel = "0.5"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

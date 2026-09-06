@@ -1,0 +1,19 @@
+# Release-артефакты и зависимости
+target/
+rustscanner/target/
+*.log
+
+# Секреты — НИКОГДА не коммитить
+*.pem
+*.key
+*.env
+.env
+.env.*
+SMB_PASS_FILE
+
+# IDE / ОС
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

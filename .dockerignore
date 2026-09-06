@@ -1,0 +1,6 @@
+# Контекст сборки
+target
+**/target
+rustscanner
+.git
+*.log
