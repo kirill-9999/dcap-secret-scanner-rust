@@ -329,6 +329,30 @@ fn value_is_placeholder(v: &str) -> bool {
         return true;
     }
 
+    // Строка вида NNN=... из строковых таблиц локализации/ресурсов
+    // (например "1133=Install" после метки "Password:").
+    let mut digits = 0;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            digits += 1;
+        } else {
+            break;
+        }
+    }
+    if digits >= 1 && s.chars().nth(digits) == Some('=') {
+        return true;
+    }
+
+    // Команда/вызов кода в значении вместо секрета (PowerShell-глаголы и похожее).
+    for prefix in [
+        "get-", "set-", "new-", "remove-", "add-", "invoke-", "import-", "export-", "test-",
+        "write-", "read-", "update-", "convertto-", "select-", "stop-", "start-",
+    ] {
+        if s.starts_with(prefix) {
+            return true;
+        }
+    }
+
     false
 }
 
