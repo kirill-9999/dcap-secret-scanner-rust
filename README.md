@@ -21,7 +21,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release
 ## Использование
 
 ```text
-dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [--state <файл>] [-v] [--presidio]
+dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [--state <файл>] [-v]
+          [--min-entropy N] [--min-length N] [--confidence-threshold N]
+          [--no-generic] [--require-mixed] [--strict-filter] [--presidio]
 ```
 
 Примеры:
@@ -30,9 +32,40 @@ dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff
 .\target\release\dcap-scan.exe "Z:\test_files" "e:\Temp\logs" 10
 .\target\release\dcap-scan.exe "C:\src" .\out.log 8 --no-sniff
 .\target\release\dcap-scan.exe "C:\src" .\out.log 8 --state .\state.tsv
+.\target\release\dcap-scan.exe "C:\src" .\out.log 8 --no-generic --strict-filter
 ```
 
 Код возврата: `0` = чисто, `1` = ошибка, `2` = найдены секреты.
+
+## Управление ложными срабатываниями
+
+Сканер уже фильтрует «не-секреты» по значению (плейсхолдеры `your_*`, `example`,
+`changeme`, строки вида `NNN=...`, вызовы команд PowerShell), а также пропускает
+находки на строках-комментариях (`#`, `//`, `;`, `*`, `--`, `<!--`, `!`). Есть
+специальные правила `JWT_SECRET` и `OAUTH_CLIENT_SECRET`. Для сложных случаев
+пороги настраиваются флагами:
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|------------|
+| `--min-entropy N` | `3.0` | Минимальная энтропия Шеннона значения (бит/символ). Работает только на правилах с `entropy_check=true`. Ниже порога — находка отбрасывается. |
+| `--min-length N` | `4` | Минимальная длина значения (применяется ко всем правилам). |
+| `--confidence-threshold N` | `0` | Отбрасывает находки правил с уверенностью ниже N (0..1). |
+| `--no-generic` | выкл | Отключает шумные правила `GENERIC_SECRET` и `GENERIC_TOKEN`. |
+| `--require-mixed` | выкл | Значение должно быть длиной ≥ 8 и содержать ≥3 из 4 категорий символов (верхний/нижний регистр, цифры, спецсимволы). Только для правил «секрет по имени». |
+| `--strict-filter` | выкл | Экстра-фильтр плейсхолдеров: `password123`, `example_123`, `simple_name`, значения короче 6 символов. |
+
+Примеры для шумных деревьев (docs, схемы, локализации):
+
+```powershell
+.\dcap-scan.exe "C:\docs" out.log 8 --no-generic --strict-filter
+.\dcap-scan.exe "C:\src"  out.log 8 --min-entropy 3.2 --no-generic
+.\dcap-scan.exe "C:\src"  out.log 8 --confidence-threshold 0.86
+```
+
+> Внимание: все флаги — фильтры-«убийцы» (снижают число находок). Они могут
+> скрыть и настоящие секреты. Проверенные отсевы на эталонном наборе:
+> `--no-generic` 39→30, `--require-mixed` 39→33, `--min-length 8` 39→38,
+> `--min-entropy 3.5` 39→26, `--confidence-threshold 0.86` 39→15.
 
 ## Лог-отчёт
 
@@ -126,6 +159,7 @@ docker run --rm -v "D:\local\data:/data" dcap-scan /data /out.log 8
 | `SMB_USER`     | пользователь (`mynas\user`)                       |
 | `SMB_PASS`     | пароль (альтернатива файлу)                       |
 | `SMB_PASS_FILE`| путь в контейнере к файлу с паролем               |
+| `SMB_DOMAIN`   | домен AD для cifs (опция `domain=`), напр. `MYNAS`; необязательно |
 | `SMB_MOUNT`    | точка монтирования (по умолч. `/mnt/share`)         |
 | `SMB_OPTS`     | доп. опции cifs, напр. `,vers=3.0,noperm,cache=none` |
 
@@ -137,4 +171,5 @@ docker run --rm -v "D:\local\data:/data" dcap-scan /data /out.log 8
 | `bench`       | 776k   | 2108.2 s     | 1785.8 s    | ~15%      |
 
 Паритет по находкам с Python-сканером подтверждён на `test_scan_tree` (1175) и
-синтетике новых паттернов (39).
+синтетике новых паттернов (39). С корпусом ложных срабатываний (локализации,
+документация, PowerCLI-скрипт) — 0 находок при сохранении эталона.
