@@ -195,6 +195,14 @@ fn build_rules() -> Vec<Rule> {
             r#"spring\s*[:._\- ]+\s*datasource\s*[:._\- ]+\s*(?:password|username)\s*[:=]\s*['"]?([^\s"';]{4,128})['"]?"#
         ),
         rule!(
+            "JWT_SECRET", "CRED_JWT_SECRET", 0.90, true, true, true,
+            r#"jwt(?:[_\-\s]*secret[_\-\s]*key|[_\-\s]*signing[_\-\s]*key|[_\-\s]*private[_\-\s]*key|[_\-\s]*secret|[_\-\s]*key)\s*[:=]\s*['"]?([A-Za-z0-9_\-]{32,})['"]?"#
+        ),
+        rule!(
+            "OAUTH_CLIENT_SECRET", "CRED_OAUTH", 0.90, true, true, true,
+            r#"client_secret\s*[:=]\s*['"]?([A-Za-z0-9_\-]{20,})['"]?"#
+        ),
+        rule!(
             "GENERIC_SECRET", "CRED_GENERIC_SECRET", 0.70, true, true, true,
             r#"(?:secret|password|credential|api[_-]?key|access[_-]?key|private[_-]?key|token|passwd)\s*[:=]\s*['"]?([A-Za-z0-9+/=_\-]{12,220})['"]?"#
         ),
@@ -271,6 +279,8 @@ const PLACEHOLDER_CHECK_RULES: &[&str] = &[
     "REDIS_REQUIREPASS",
     "DOTNET_CONNECTION_STRING",
     "JDBC_UA_PASSWORD",
+    "JWT_SECRET",
+    "OAUTH_CLIENT_SECRET",
 ];
 
 /// Является ли значение «не-секретом»: плейсхолдер, служебное слово, ссылка на
@@ -872,6 +882,7 @@ fn run_scan(
     verbose: bool,
     threads: usize,
     state_path: Option<&Path>,
+    tuning: Tuning,
 ) -> ScanOut {
     let rules = Arc::new(build_rules());
     let prefilter = Arc::new(build_prefilter(&rules));
@@ -1011,6 +1022,7 @@ fn run_scan(
         let encoding = encoding.to_string();
         let sniff = sniff;
         let verbose = verbose;
+        let tuning = tuning;
         let state_tx = state_tx.clone();
         work_handles.push(std::thread::spawn(move || {
             while let Ok(item) = file_rx.recv() {
@@ -1024,6 +1036,7 @@ fn run_scan(
                     &prefilter,
                     &shared,
                     state_tx.as_ref(),
+                    tuning,
                 );
                 processed.fetch_add(1, Ordering::Relaxed);
             }
@@ -1115,6 +1128,7 @@ fn process_file(
     prefilter: &Regex,
     shared: &Mutex<Shared>,
     state_tx: Option<&Sender<StateEvent>>,
+    tuning: Tuning,
 ) {
     let path_str = path.to_string_lossy().into_owned();
     let hint = is_credential_file(path);
@@ -1154,7 +1168,7 @@ fn process_file(
         s.files_scanned += 1;
     }
 
-    scan_text(&path_str, &text, rules, prefilter, shared, verbose, state_tx);
+    scan_text(&path_str, &text, rules, prefilter, shared, verbose, state_tx, &tuning);
 
     if let Some(tx) = state_tx {
         let _ = tx.send(StateEvent::Processed(path_str.clone()));
@@ -1208,6 +1222,7 @@ fn scan_text(
     shared: &Mutex<Shared>,
     _verbose: bool,
     state_tx: Option<&Sender<StateEvent>>,
+    tuning: &Tuning,
 ) {
     if prefilter.find(text).is_none() {
         return;
@@ -1217,14 +1232,34 @@ fn scan_text(
             let m = caps.get(1).or_else(|| caps.get(0));
             let Some(m) = m else { continue };
             let value = m.as_str();
-            if value.chars().count() < 4 {
+            if value.chars().count() < tuning.min_length {
                 continue;
             }
-            if rule.entropy_check && shannon_entropy(value) < 3.0 {
+            if tuning.no_generic
+                && (rule.name == "GENERIC_SECRET" || rule.name == "GENERIC_TOKEN")
+            {
                 continue;
             }
-            if PLACEHOLDER_CHECK_RULES.contains(&rule.name) && value_is_placeholder(value) {
+            if rule.confidence < tuning.confidence_threshold {
                 continue;
+            }
+            if rule.entropy_check && shannon_entropy(value) < tuning.min_entropy {
+                continue;
+            }
+            if PLACEHOLDER_CHECK_RULES.contains(&rule.name) {
+                if value_is_placeholder(value) {
+                    continue;
+                }
+                // Маркеры комментариев/документации: #, //, ;, *, --, <!--, !
+                if is_comment_line(text, m.start()) {
+                    continue;
+                }
+                if tuning.require_mixed && !looks_like_real_secret(value) {
+                    continue;
+                }
+                if tuning.strict_filter && value_flagged_by_strict_filter(value) {
+                    continue;
+                }
             }
             let line_num = line_number_at(text, m.start());
             let start = text.floor_char_boundary(m.start().saturating_sub(80));
@@ -1250,6 +1285,84 @@ fn scan_text(
 // CLI
 // ---------------------------------------------------------------------------
 
+/// Пороги фильтрации, управляемые из командной строки.
+#[derive(Clone, Copy)]
+struct Tuning {
+    min_entropy: f64,
+    min_length: usize,
+    no_generic: bool,
+    confidence_threshold: f64,
+    require_mixed: bool,
+    strict_filter: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            min_entropy: 3.0,
+            min_length: 4,
+            no_generic: false,
+            confidence_threshold: 0.0,
+            require_mixed: false,
+            strict_filter: false,
+        }
+    }
+}
+
+/// Начинается ли строка совпадения с маркера комментария.
+/// Применяется только к «правилам по значению» (не к структурным: SSH, JWT и т.п.).
+fn is_comment_line(text: &str, match_start: usize) -> bool {
+    let line_start = text[..match_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let before = text[line_start..match_start].trim_start();
+    const MARKERS: &[&str] = &["#", "//", ";", "*", "--", "<!--", "!"];
+    MARKERS.iter().any(|m| before.starts_with(m))
+}
+
+/// Значение похоже на «настоящий» секрет: длина >= 8 и минимум 3 из 4
+/// категорий символов (верхний/нижний регистр, цифры, спецсимволы).
+fn looks_like_real_secret(v: &str) -> bool {
+    if v.chars().count() < 8 {
+        return false;
+    }
+    let has_upper = v.chars().any(|c| c.is_uppercase());
+    let has_lower = v.chars().any(|c| c.is_lowercase());
+    let has_digit = v.chars().any(|c| c.is_ascii_digit());
+    let has_special = v.chars().any(|c| !c.is_alphanumeric());
+    let score = [has_upper, has_lower, has_digit, has_special]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+    score >= 3
+}
+
+/// Экстра-фильтр плейсхолдеров (рискованный, включается только --strict-filter):
+/// password123, example_123, simple_name, слишком короткие значения.
+fn value_flagged_by_strict_filter(v: &str) -> bool {
+    let s = v.trim().to_lowercase();
+    if s.chars().count() < 6 {
+        return true;
+    }
+    let stem = s.trim_end_matches(|c: char| c.is_ascii_digit());
+    if ["password", "secret", "token", "pass", "pwd", "key"]
+        .iter()
+        .any(|w| stem == *w || s.starts_with(w))
+    {
+        return true;
+    }
+    if stem.ends_with('_') && stem.len() > 1 && s.chars().count() > stem.len() {
+        return true; // example_123 / my_secret_2024
+    }
+    let parts: Vec<&str> = s.split('_').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 2
+        && parts
+            .iter()
+            .all(|p| p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+    {
+        return true; // simple_name
+    }
+    false
+}
+
 struct Args {
     folder: PathBuf,
     log: PathBuf,
@@ -1258,12 +1371,19 @@ struct Args {
     sniff: bool,
     verbose: bool,
     state: Option<PathBuf>,
+    tuning: Tuning,
 }
 
 fn usage() -> ! {
     eprintln!(
         "Использование: dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [--state <файл>] [-v] [--presidio]"
     );
+    eprintln!("  --min-entropy <N>            мин. энтропия Шеннона (по умолчанию 3.0)");
+    eprintln!("  --min-length <N>             мин. длина значения (по умолчанию 4)");
+    eprintln!("  --no-generic                 отключить GENERAL_* правила");
+    eprintln!("  --confidence-threshold <N>   мин. уверенность правила 0..1 (по умолчанию 0)");
+    eprintln!("  --require-mixed              значение должно содержать >=3 из 4 категорий символов");
+    eprintln!("  --strict-filter              экстра-фильтр плейсхолдеров (password123, simple_name, <6 симв.)");
     std::process::exit(1);
 }
 
@@ -1275,11 +1395,32 @@ fn parse_args() -> Args {
     let mut encoding = "utf-8".to_string();
     let mut state: Option<PathBuf> = None;
     let mut threads_arg: Option<String> = None;
+    let mut tuning = Tuning::default();
 
     while let Some(a) = it.next() {
         match a.as_str() {
             "--no-sniff" => sniff = false,
             "-v" | "--verbose" => verbose = true,
+            "--no-generic" => tuning.no_generic = true,
+            "--require-mixed" => tuning.require_mixed = true,
+            "--strict-filter" => tuning.strict_filter = true,
+            "--min-entropy" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if v.is_finite() && v >= 0.0 => tuning.min_entropy = v,
+                _ => usage(),
+            },
+            "--min-length" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) => tuning.min_length = v,
+                None => usage(),
+            },
+            "--confidence-threshold" => match it
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
+                Some(v) if v.is_finite() && v >= 0.0 && v <= 1.0 => {
+                    tuning.confidence_threshold = v;
+                }
+                _ => usage(),
+            },
             "--presidio" => {
                 eprintln!(
                     "[i] Presidio не поддерживается в Rust-версии, работает regex-режим"
@@ -1318,6 +1459,7 @@ fn parse_args() -> Args {
         sniff,
         verbose,
         state,
+        tuning,
     }
 }
 
@@ -1390,6 +1532,15 @@ fn main() {
         "[i] Sniff файлов без расширения: {}",
         if args.sniff { "вкл" } else { "выкл" }
     );
+    println!(
+        "[i] Тюнинг: min_entropy={} min_length={} confidence>={} no_generic={} require_mixed={} strict={}",
+        args.tuning.min_entropy,
+        args.tuning.min_length,
+        args.tuning.confidence_threshold,
+        args.tuning.no_generic,
+        args.tuning.require_mixed,
+        args.tuning.strict_filter,
+    );
     if let Some(sp) = &args.state {
         println!("[i] State: {}", sp.display());
     }
@@ -1407,6 +1558,7 @@ fn main() {
         args.verbose,
         args.threads,
         args.state.as_deref(),
+        args.tuning,
     );
 
     println!();
