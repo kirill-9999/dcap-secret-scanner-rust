@@ -17,6 +17,7 @@ services:
     environment:
       SMB_SHARE: ${SMB_SHARE:-}
       SMB_USER: ${SMB_USER:-}
+      SMB_DOMAIN: ${SMB_DOMAIN:-}
       SMB_PASS: ${SMB_PASS:-}
       SMB_PASS_FILE: ${SMB_PASS_FILE:-/secrets/password.txt}
       SMB_OPTS: ${SMB_OPTS:-,vers=3.0,noperm,cache=none}

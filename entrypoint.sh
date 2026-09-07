@@ -4,10 +4,14 @@
 # Поддерживает сканирование сетевых SMB-шаров (например Z: = //mynas/MainStorage)
 # через переменные окружения:
 #   SMB_SHARE  - путь к шаре, например //mynas/MainStorage
-#   SMB_USER   - пользователь домена (mynas\user или user@domain)
+#   SMB_USER   - имя пользователя
+#   SMB_DOMAIN - домен Windows (WORKGROUP или DOMAIN). Передаётся как option
+#                domain=... в mount.cifs. Можно не задавать (если домен уже
+#                включён в SMB_USER вида mynas\user или user@domain).
 #   SMB_PASS   - пароль (или SMB_PASS_FILE)
 #   SMB_PASS_FILE - путь к файлу с паролем (`--mount type=bind,source=...,target=/secret.txt:ro`)
 #   SMB_MOUNT  - точка монтирования внутри контейнера (по умолчанию /mnt/share)
+#   SMB_OPTS   - дополнительные опции mount.cifs (по умолчанию ,noperm,vers=3.0,cache=none)
 #   TARGET     - что сканировать. Если задан SMB_SHARE — маунтим и сканируем SMB_MOUNT.
 #                Если нет — сканируем переданный аргументом путь (например bind-mounted папку).
 #
@@ -32,7 +36,12 @@ if [ -n "$SMB_SHARE" ]; then
         exit 1
     fi
 
-    MOUNT_ARGS="-o username=${SMB_USER:-},password=$PASS,${SMB_OPTS:-,noperm,vers=3.0,cache=none}"
+    # Опции mount.cifs. Базовые собираем из SMB_OPTS (с значениями по умолчанию),
+    # домен добавляем отдельной опцией только если SMB_DOMAIN задан.
+    SMB_OPTS="${SMB_OPTS:-,noperm,vers=3.0,cache=none}"
+    [ -n "$SMB_DOMAIN" ] && SMB_OPTS="$SMB_OPTS,domain=$SMB_DOMAIN"
+
+    MOUNT_ARGS="-o username=${SMB_USER:-},password=$PASS,$SMB_OPTS"
     mount -t cifs "$SMB_SHARE" "$MOUNT" $MOUNT_ARGS
 
     T="${1:-$MOUNT}"
