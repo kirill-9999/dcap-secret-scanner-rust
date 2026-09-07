@@ -204,7 +204,7 @@ fn build_rules() -> Vec<Rule> {
             r#"(?:password|pass|passwd|pwd)\s*[:=]\s*['"]([^\s'"]{3,128})['"]"#
         ),
         rule!(
-            "ENV_PASSWORD", "CRED_PASSWORD", 0.90, false, true, false,
+            "ENV_PASSWORD", "CRED_PASSWORD", 0.90, true, true, false,
             r#"(?:DB_PASSWORD|MYSQL_PASSWORD|POSTGRES_PASSWORD|REDIS_PASSWORD|MONGO_PASSWORD|SMTP_PASSWORD)\s*[:=]\s*['"]?([^\s'"]{3,128})['"]?"#
         ),
         rule!(
@@ -249,6 +249,87 @@ fn shannon_entropy(s: &str) -> f64 {
         h -= p * p.log2();
     }
     h
+}
+
+/// Правила, у которых значение группы 1 — «секрет по имени» и его надо проверять
+/// на плейсхолдеры/служебные слова, чтобы не ловить README, схемы и шаблоны.
+/// Структурные правила (SSH-ключи, JWT, URI, JDBC, kubeconfig и т.п.) не фильтруем.
+const PLACEHOLDER_CHECK_RULES: &[&str] = &[
+    "PASSWORD",
+    "PASSWORD_QUOTED",
+    "API_KEY",
+    "AWS_SECRET_KEY",
+    "GENERIC_TOKEN",
+    "GENERIC_SECRET",
+    "BEARER_TOKEN",
+    "NETWORK_PASSWORD",
+    "ENV_PASSWORD",
+    "ENV_PASSWORD_GENERIC",
+    "ENV_CRED_VAR",
+    "JAAS_PASSWORD",
+    "SPRING_DATASOURCE",
+    "REDIS_REQUIREPASS",
+    "DOTNET_CONNECTION_STRING",
+    "JDBC_UA_PASSWORD",
+];
+
+/// Является ли значение «не-секретом»: плейсхолдер, служебное слово, ссылка на
+/// переменную, пример из документации. Если да — это почти наверняка не пароль.
+fn value_is_placeholder(v: &str) -> bool {
+    let s = v
+        .trim()
+        .trim_matches(['.', ',', ';', ':', '!', '?', '-'])
+        .to_lowercase();
+    if s.is_empty() {
+        return true;
+    }
+
+    // Само слово-ключ и частые служебные/примерные значения.
+    const WORDS: &[&str] = &[
+        "password", "passwd", "pwd", "pass", "secret", "secrets", "token", "tokens", "apikey",
+        "api_key", "credential", "credentials", "undefined", "unknown", "null", "none", "true",
+        "false", "default", "sample", "example", "demo", "dummy", "test", "placeholder",
+        "changeme", "change_me", "changethis", "changeit", "replaceme", "replace_me", "redacted",
+        "hidden", "removed", "notset", "not_set", "not_configured", "to_be_set", "to_be_changed",
+        "postgres", "redis", "mysql", "admin", "root", "guest", "toor", "letmein", "password1",
+        "password123", "pass123", "pass1234", "secret123", "admin123", "yourpassword",
+        "your_password", "yoursecret", "your_secret", "yourtoken", "your_token", "yourapikey",
+        "your_api_key", "yourkey", "your_key", "yourvalue", "your_value", "xxxx", "xxxxx",
+        "xxxxxx", "xxxxxxx", "xxxxxxxx", "1234", "12345", "123456", "1234567", "12345678",
+        "123456789", "1234567890", "0000", "1111", "00000000", "11111111",
+    ];
+    if WORDS.contains(&s.as_str()) {
+        return true;
+    }
+
+    // Ссылки на переменные окружения / шаблонные подстановки / HTML.
+    if s.contains("${") || s.contains("{{") || s.contains("}}") || s.ends_with('}')
+        || s.contains('%') || s.contains('<') || s.contains('>')
+    {
+        return true;
+    }
+
+    // Классические плейсхолдеры вида your_*, *_here, *example*, *changeme*.
+    if s.starts_with("your_") || s.starts_with("your-") || s.ends_with("_here")
+        || s.ends_with("-here") || s.contains("changeme") || s.contains("replaceme")
+        || s.contains("example") || s.contains("placeholder")
+    {
+        return true;
+    }
+
+    // URL/почта вместо пароля.
+    if s.contains("://") || s.contains("@.") {
+        return true;
+    }
+
+    // Только цифры или один повторяющийся символ — типичные значения-заглушки.
+    if s.chars().all(|c| c.is_ascii_digit())
+        || s.chars().nth(1).map_or(false, |c| s.chars().all(|x| x == c))
+    {
+        return true;
+    }
+
+    false
 }
 
 fn line_number_at(text: &str, byte_offset: usize) -> usize {
@@ -1116,6 +1197,9 @@ fn scan_text(
                 continue;
             }
             if rule.entropy_check && shannon_entropy(value) < 3.0 {
+                continue;
+            }
+            if PLACEHOLDER_CHECK_RULES.contains(&rule.name) && value_is_placeholder(value) {
                 continue;
             }
             let line_num = line_number_at(text, m.start());
