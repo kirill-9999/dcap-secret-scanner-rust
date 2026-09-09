@@ -663,6 +663,7 @@ struct Shared {
     files_scanned: usize,
     files_skipped: usize,
     files_error: usize,
+    dir_error: usize,
     find_count: usize,
     by_subcategory: HashMap<String, usize>,
     seen_keys: HashSet<String>,
@@ -823,6 +824,7 @@ fn write_report(
         "# Файлов:      {} скан | {} пропуск | {} ошибок | {} возобновлено\n",
         shared.files_scanned, shared.files_skipped, shared.files_error, resumed
     ));
+    out.push_str(&format!("# Каталогов с ошибкой: {}\n", shared.dir_error));
     out.push_str(&format!("# Находок:     {}\n", shared.find_count));
     out.push('\n');
 
@@ -869,6 +871,7 @@ struct ScanOut {
     files_scanned: usize,
     files_skipped: usize,
     files_error: usize,
+    dir_error: usize,
     resumed: usize,
     find_count: usize,
     by_subcategory: HashMap<String, usize>,
@@ -933,6 +936,7 @@ fn run_scan(
         let resume_processed = resume_processed.clone();
         let resumed = resumed.clone();
         let sniff = sniff;
+        let shared = shared.clone();
         dir_handles.push(std::thread::spawn(move || {
             loop {
                 let dir = {
@@ -953,7 +957,15 @@ fn run_scan(
                             let path = entry.path();
                             let ft = match entry.file_type() {
                                 Ok(ft) => ft,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    let mut s = shared.lock().unwrap();
+                                    s.dir_error += 1;
+                                    s.failures.push((
+                                        path.to_string_lossy().into_owned(),
+                                        format!("не удалось получить тип записи: {e}"),
+                                    ));
+                                    continue;
+                                }
                             };
                             if ft.is_symlink() {
                                 if path.is_dir() {
@@ -991,7 +1003,14 @@ fn run_scan(
                             }
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        let mut s = shared.lock().unwrap();
+                        s.dir_error += 1;
+                        s.failures.push((
+                            dir.to_string_lossy().into_owned(),
+                            format!("не удалось прочитать каталог: {e}"),
+                        ));
+                    }
                 }
                 {
                     let lock = &state.0;
@@ -1101,6 +1120,10 @@ fn run_scan(
     }
 
     println!("[i] Файлов к обработке: {produced_n}, подпапок: {subdirs_n}");
+    let dir_errors = shared.lock().unwrap().dir_error;
+    if dir_errors > 0 {
+        println!("[!] Каталогов, которые не удалось прочитать: {dir_errors} — см. [НЕ УДАЛОСЬ ОБРАБОТАТЬ] в логе");
+    }
     println!("[i] Время: {elapsed:.1} сек");
 
     let out = {
@@ -1109,6 +1132,7 @@ fn run_scan(
             files_scanned: g.files_scanned,
             files_skipped: g.files_skipped,
             files_error: g.files_error,
+            dir_error: g.dir_error,
             resumed: resumed_n,
             find_count: g.find_count,
             by_subcategory: g.by_subcategory.clone(),
@@ -1565,10 +1589,12 @@ fn main() {
     println!("{}", "=".repeat(60));
     println!("  Сканирование завершено");
     println!("  Папка:     {}", folder.display());
-    println!(
-        "  Файлов:    {} скан | {} пропуск | {} ошибок | {} возобновлено",
+    println!("  Файлов:    {} скан | {} пропуск | {} ошибок | {} возобновлено",
         out.files_scanned, out.files_skipped, out.files_error, out.resumed,
     );
+    if out.dir_error > 0 {
+        println!("  [!] Каталогов не прочитано: {} (см. [НЕ УДАЛОСЬ ОБРАБОТАТЬ] в логе)", out.dir_error);
+    }
     println!("  Находок:   {}", out.find_count);
     if !out.by_subcategory.is_empty() {
         println!();
