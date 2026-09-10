@@ -52,7 +52,7 @@ UNIFIED = env("UNIFIED_LOG", os.path.join(MANAGER, "unified.log"))
 SMB_USER = env("SMB_USER", "")
 SMB_PASS = env("SMB_PASS", "")
 if env("SMB_PASS_FILE", "") and os.path.isfile(env("SMB_PASS_FILE", "")):
-    SMB_PASS = open(env("SMB_PASS_FILE"), encoding="utf-8").read().strip()
+    SMB_PASS = open(env("SMB_PASS_FILE", ""), encoding="utf-8").read().strip()
 SMB_DOMAIN = env("SMB_DOMAIN", "")
 SMB_OPTS = env("SMB_OPTS", ",noperm,vers=3.0,cache=none")
 
