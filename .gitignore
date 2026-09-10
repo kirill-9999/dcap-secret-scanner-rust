@@ -20,3 +20,7 @@ SMB_PASS_FILE
 *.iml
 .DS_Store
 Thumbs.db
+
+# Python runner
+__pycache__/
+*.pyc

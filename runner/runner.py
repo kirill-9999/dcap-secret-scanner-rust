@@ -27,6 +27,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -207,6 +208,10 @@ def new_cycle(prev):
 RE_FILE_HEADER = re.compile(r"# Файлов:\s+(\d+)\s+скан")
 RE_FIND_HEADER = re.compile(r"# Находок:\s+(\d+)")
 RE_FIND_LINE = re.compile(r"^(.+?):(\d+)\s*::\s*(.+?)\s+\(conf\s+([\d.]+)\)\s*$")
+RE_PROGRESS = re.compile(r"^\[i\] Прогресс:")
+RE_ITOGO = re.compile(
+    r"^\[i\] Итого по ресурсу: файлов (\d+), с находками (\d+), "
+    r"без находок (\d+), с ошибками (\d+), пропущено (\d+)$")
 
 
 def aggregate(url, slug, cycle_no, scan_root, report_path):
@@ -279,6 +284,24 @@ def scan_resource(url, scan_root, cycle_no, slug):
         proc = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace")
+        lines = []
+        res_totals = None
+
+        def read_loop():
+            nonlocal res_totals
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                lines.append(line)
+                if line.startswith("[i] Прогресс"):
+                    log(f"  [{slug}] {line}")
+                elif line.startswith("[i] Итого по ресурсу"):
+                    log(f"  [{slug}] {line}")
+                    m = RE_ITOGO.match(line)
+                    if m:
+                        res_totals = [int(g) for g in m.groups()]
+
+        reader = threading.Thread(target=read_loop, daemon=True)
+        reader.start()
         outcome = None
         while proc.poll() is None:
             if stop_requested or os.path.exists(STOP_FILE):
@@ -292,22 +315,23 @@ def scan_resource(url, scan_root, cycle_no, slug):
                 outcome = "paused"
                 break
             time.sleep(1)
-        out, _ = proc.communicate()
+        reader.join(timeout=5)
+        out = "\n".join(lines) + "\n"
         if outcome == "stop":
-            return None
+            return None, None
         if outcome == "paused":
             log(f"  [{slug}] пауза, жду снятия (control/pause)")
             while os.path.exists(PAUSE_FILE) and not stop_requested:
                 time.sleep(2)
             if stop_requested:
-                return None
+                return None, None
             log(f"  [{slug}] пауза снята, продолжаю с места останова")
             continue
         if proc.returncode not in (0, 2):
             raise RuntimeError(f"сканер завершился с кодом {proc.returncode}")
         m = re.search(r"Лог\s*:\s*(\S+)", out)
         report_path = m.group(1).strip() if m else report_base
-        return report_path
+        return report_path, res_totals
 
 
 def record_done(cycle, slug, files, find_count):
@@ -320,26 +344,34 @@ def record_done(cycle, slug, files, find_count):
 
 
 def run_pass(cycle, resources):
-    for url in resources:
+    n = len(resources)
+    totals = [0, 0, 0, 0, 0]
+    for i, url in enumerate(resources, 1):
         if stop_requested or os.path.exists(STOP_FILE):
             log("остановка между ресурсами")
             return False
         slug = slug_for(url)
-        if cycle["resources"].get(slug, {}).get("status") == "done":
-            log(f"  пропускаю {url} (завершён в этом проходе)")
+        st = cycle["resources"].get(slug, {}).get("status")
+        if st == "done":
+            saved = cycle["resources"][slug].get("files", 0)
+            log(f"  ресурс {i}/{n}: завершён в этом проходе ({url}), файлов {saved}")
             continue
+        if st == "error":
+            log(f"  ресурс {i}/{n}: ошибка в этом проходе ({url})")
+            continue
+        log(f"  ресурс {i}/{n}: {url}")
         try:
             scan_root, note = ensure_mounted(url)
         except RuntimeError as exc:
-            log(f"  {url}: {exc}; пропускаю")
+            log(f"    {url}: {exc}; пропускаю")
             cycle["resources"][slug] = {"status": "error", "reason": str(exc)}
             save_cycle(cycle)
             continue
-        log(f"  [{slug}] {url} -> {scan_root} ({note})")
+        log(f"    [{slug}] {url} -> {scan_root} ({note})")
         try:
-            report_path = scan_resource(url, scan_root, cycle["cycle"], slug)
+            report_path, res_totals = scan_resource(url, scan_root, cycle["cycle"], slug)
         except RuntimeError as exc:
-            log(f"  {url}: {exc}; пропускаю")
+            log(f"    {url}: {exc}; пропускаю")
             cycle["resources"][slug] = {"status": "error", "reason": str(exc)}
             save_cycle(cycle)
             continue
@@ -349,10 +381,26 @@ def run_pass(cycle, resources):
             files, find_count = aggregate(
                 url, slug, cycle["cycle"], scan_root.rstrip("/") + "/", report_path)
             record_done(cycle, slug, files, find_count)
-            log(f"  [{slug}] готово: файлов {files}, находок {find_count}")
+            log(f"    [{slug}] готово: файлов {files}, находок {find_count}")
+            if res_totals:
+                for k in range(5):
+                    totals[k] += res_totals[k]
+        done_now = sum(
+            1 for r in resources
+            if cycle["resources"].get(slug_for(r), {}).get("status") in ("done", "error"))
+        log(f"  обработано ресурсов {done_now}/{n}, осталось {n - done_now}")
+        if done_now:
+            log(f"  итого по проходу: файлов {totals[0]}, с находками {totals[1]}, "
+                f"без находок {totals[2]}, с ошибками {totals[3]}, пропущено {totals[4]}")
     cycle["completed"] = True
     cycle["finished"] = datetime.now().isoformat(timespec="seconds")
     save_cycle(cycle)
+    if totals[0]:
+        log(f"  итог прохода: ресурсов {n}, файлов {totals[0]}, "
+            f"с находками {totals[1]}, без находок {totals[2]}, "
+            f"с ошибками {totals[3]}, пропущено {totals[4]}")
+    else:
+        log("  итог прохода: ресурсы не сканировались (пропущены или ошибки)")
     return True
 
 

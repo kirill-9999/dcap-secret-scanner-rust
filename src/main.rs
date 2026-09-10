@@ -1080,34 +1080,33 @@ fn run_scan(
     }
     drop(file_rx);
 
-    // Прогресс
+    // Прогресс (построчный вывод - читается в логах контейнера)
     let progress_done = Arc::new(AtomicBool::new(false));
     {
         let progress_done = progress_done.clone();
         let processed = processed.clone();
-        let start = start;
+        let produced = produced.clone();
+        let resumed = resumed.clone();
+        let shared = shared.clone();
         std::thread::spawn(move || {
-            let mut last = 0usize;
-            let mut last_t = Instant::now();
             while !progress_done.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(2000));
+                std::thread::sleep(Duration::from_millis(3000));
                 if progress_done.load(Ordering::Relaxed) {
                     break;
                 }
-                let now = processed.load(Ordering::Relaxed);
-                let _t = start.elapsed().as_secs_f64();
-                let dt = (Instant::now() - last_t).as_secs_f64();
-                let rate = if dt > 0.0 {
-                    (now - last) as f64 / dt
-                } else {
-                    0.0
+                let handled = processed.load(Ordering::Relaxed) + resumed.load(Ordering::Relaxed);
+                let total = produced.load(Ordering::Relaxed) + resumed.load(Ordering::Relaxed);
+                let left = total.saturating_sub(handled);
+                let (wf, err) = {
+                    let s = shared.lock().unwrap();
+                    (s.flagged_files.len(), s.files_error)
                 };
-                eprint!("\rОбработано: {} файлов ({:.0}/s)          ", now, rate);
-                let _ = std::io::stderr().flush();
-                last = now;
-                last_t = Instant::now();
+                let clean = handled.saturating_sub(wf + err);
+                println!(
+                    "[i] Прогресс: всего {total}, обработано {handled}, осталось {left}, \
+                     с находками {wf}, без находок {clean}, с ошибками {err}"
+                );
             }
-            eprint!("\r                                                      \r");
         });
     }
 
@@ -1142,6 +1141,20 @@ fn run_scan(
         println!("[!] Каталогов, которые не удалось прочитать: {dir_errors} — см. [НЕ УДАЛОСЬ ОБРАБОТАТЬ] в логе");
     }
     println!("[i] Время: {elapsed:.1} сек");
+
+    {
+        let s = shared.lock().unwrap();
+        let wf = s.flagged_files.len();
+        let err = s.files_error;
+        let scanned = s.files_scanned;
+        let skipped_f = s.files_skipped;
+        let done_total = scanned + err + resumed_n;
+        let clean = done_total.saturating_sub(wf + err);
+        println!(
+            "[i] Итого по ресурсу: файлов {done_total}, с находками {wf}, \
+             без находок {clean}, с ошибками {err}, пропущено {skipped_f}"
+        );
+    }
 
     let out = {
         let g = shared.lock().unwrap();
