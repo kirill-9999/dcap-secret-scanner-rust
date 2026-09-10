@@ -149,6 +149,11 @@ def ensure_mounted(url):
     return mount, "смонтирован сейчас"
 
 
+def umount_share(scan_root, slug):
+    subprocess.run(["umount", scan_root], check=False)
+    log(f"  [{slug}] размонтировал {scan_root}")
+
+
 def parse_schedule(s):
     s = (s or "").strip().lower()
     if s in ("", "always", "-", "none"):
@@ -380,24 +385,28 @@ def run_pass(cycle, resources):
             continue
         log(f"    [{slug}] {url} -> {scan_root} ({note})")
         s_t0 = time.monotonic()
+        mounted_now = note == "смонтирован сейчас"
         try:
             report_path, res_totals = scan_resource(url, scan_root, cycle["cycle"], slug)
+            if report_path is None:
+                return False
+            if os.path.exists(report_path):
+                files, find_count = aggregate(
+                    url, slug, cycle["cycle"], scan_root.rstrip("/") + "/", report_path)
+                record_done(cycle, slug, files, find_count)
+                s_el = max(time.monotonic() - s_t0, 0.001)
+                log(f"    [{slug}] готово: файлов {files}, находок {find_count} ({files / s_el:.1f}/с)")
+                if res_totals:
+                    for k in range(5):
+                        totals[k] += res_totals[k]
         except RuntimeError as exc:
             log(f"    {url}: {exc}; пропускаю")
             cycle["resources"][slug] = {"status": "error", "reason": str(exc)}
             save_cycle(cycle)
             continue
-        if report_path is None:
-            return False
-        if os.path.exists(report_path):
-            files, find_count = aggregate(
-                url, slug, cycle["cycle"], scan_root.rstrip("/") + "/", report_path)
-            record_done(cycle, slug, files, find_count)
-            s_el = max(time.monotonic() - s_t0, 0.001)
-            log(f"    [{slug}] готово: файлов {files}, находок {find_count} ({files / s_el:.1f}/с)")
-            if res_totals:
-                for k in range(5):
-                    totals[k] += res_totals[k]
+        finally:
+            if mounted_now:
+                umount_share(scan_root, slug)
         done_now = sum(
             1 for r in resources
             if cycle["resources"].get(slug_for(r), {}).get("status") in ("done", "error"))
