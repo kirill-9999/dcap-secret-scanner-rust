@@ -213,7 +213,7 @@ RE_FIND_HEADER = re.compile(r"# Находок:\s+(\d+)")
 RE_FIND_LINE = re.compile(r"^(.+?):(\d+)\s*::\s*(.+?)\s+\(conf\s+([\d.]+)\)\s*$")
 RE_PROGRESS = re.compile(r"^\[i\] Прогресс:")
 RE_ITOGO = re.compile(
-    r"^\[i\] Итого по ресурсу: файлов (\d+), с находками (\d+), "
+    r"^\[i\] Итого по ресурсу: файлов (\d+)(?: \([^)]*\))?, с находками (\d+), "
     r"без находок (\d+), с ошибками (\d+), пропущено (\d+)$")
 
 
@@ -349,6 +349,7 @@ def record_done(cycle, slug, files, find_count):
 def run_pass(cycle, resources):
     n = len(resources)
     totals = [0, 0, 0, 0, 0]
+    pass_t0 = time.monotonic()
     for i, url in enumerate(resources, 1):
         if stop_requested or os.path.exists(STOP_FILE):
             log("остановка между ресурсами")
@@ -371,6 +372,7 @@ def run_pass(cycle, resources):
             save_cycle(cycle)
             continue
         log(f"    [{slug}] {url} -> {scan_root} ({note})")
+        s_t0 = time.monotonic()
         try:
             report_path, res_totals = scan_resource(url, scan_root, cycle["cycle"], slug)
         except RuntimeError as exc:
@@ -384,7 +386,8 @@ def run_pass(cycle, resources):
             files, find_count = aggregate(
                 url, slug, cycle["cycle"], scan_root.rstrip("/") + "/", report_path)
             record_done(cycle, slug, files, find_count)
-            log(f"    [{slug}] готово: файлов {files}, находок {find_count}")
+            s_el = max(time.monotonic() - s_t0, 0.001)
+            log(f"    [{slug}] готово: файлов {files}, находок {find_count} ({files / s_el:.1f}/с)")
             if res_totals:
                 for k in range(5):
                     totals[k] += res_totals[k]
@@ -393,13 +396,16 @@ def run_pass(cycle, resources):
             if cycle["resources"].get(slug_for(r), {}).get("status") in ("done", "error"))
         log(f"  обработано ресурсов {done_now}/{n}, осталось {n - done_now}")
         if done_now:
-            log(f"  итого по проходу: файлов {totals[0]}, с находками {totals[1]}, "
-                f"без находок {totals[2]}, с ошибками {totals[3]}, пропущено {totals[4]}")
+            pass_el = max(time.monotonic() - pass_t0, 0.001)
+            log(f"  итого по проходу: файлов {totals[0]} ({totals[0] / pass_el:.1f}/с), "
+                f"с находками {totals[1]}, без находок {totals[2]}, "
+                f"с ошибками {totals[3]}, пропущено {totals[4]}")
     cycle["completed"] = True
     cycle["finished"] = datetime.now().isoformat(timespec="seconds")
     save_cycle(cycle)
+    pass_el = max(time.monotonic() - pass_t0, 0.001)
     if totals[0]:
-        log(f"  итог прохода: ресурсов {n}, файлов {totals[0]}, "
+        log(f"  итог прохода: ресурсов {n}, файлов {totals[0]} ({totals[0] / pass_el:.1f}/с), "
             f"с находками {totals[1]}, без находок {totals[2]}, "
             f"с ошибками {totals[3]}, пропущено {totals[4]}")
     else:

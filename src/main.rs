@@ -1160,8 +1160,13 @@ fn run_scan(
         let skipped_f = s.files_skipped;
         let done_total = scanned + err + resumed_n;
         let clean = done_total.saturating_sub(wf + err);
+        let rate = if elapsed > 0.0 {
+            done_total as f64 / elapsed
+        } else {
+            0.0
+        };
         println!(
-            "[i] Итого по ресурсу: файлов {done_total}, с находками {wf}, \
+            "[i] Итого по ресурсу: файлов {done_total} ({rate:.1}/с), с находками {wf}, \
              без находок {clean}, с ошибками {err}, пропущено {skipped_f}"
         );
     }
