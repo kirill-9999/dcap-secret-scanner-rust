@@ -8,8 +8,10 @@
   MOUNT_ROOT     - корень точек монтирования SMB-ресурсов (по умолчанию /mnt/shares)
   SCHEDULE       - окна работы вида "HH:MM-HH:MM;HH:MM-HH:MM" или "always"
                    (по умолчанию "always" - работает, пока не остановят)
-  SCAN_LOOP      - "1" - в окне запускать новые проходы сразу после завершения
-                   (по умолчанию "0" - один полный проход на одно окно)
+SCAN_LOOP      - "1" - в окне запускать новые проходы сразу после завершения
+                    (по умолчанию "0" - один полный проход на одно окно)
+   RUN_ONCE       - "1" - один полный проход по списку, затем завершение работы
+                    (по умолчанию "0" - работа, пока не остановят; удобно с SCHEDULE)
   UNIFIED_LOG    - единый лог находок (по умолчанию <MANAGER_DIR>/unified.log)
   SCANNER        - путь к бинарю сканера (по умолчанию /usr/local/bin/dcap-scan)
   SCAN_THREADS   - число потоков сканера (по умолчанию 4)
@@ -45,6 +47,7 @@ MOUNT_ROOT = env("MOUNT_ROOT", "/mnt/shares")
 LIST = env("RESOURCE_LIST", "") or os.path.join(MANAGER, "conf", "list.txt")
 SCHEDULE = env("SCHEDULE", "always")
 SCAN_LOOP = env("SCAN_LOOP", "0") == "1"
+RUN_ONCE = env("RUN_ONCE", "0") == "1"
 SCANNER = env("SCANNER", "/usr/local/bin/dcap-scan")
 SCAN_THREADS = int(env("SCAN_THREADS", "4"))
 SCAN_ARGS = env("SCAN_ARGS", "").split()
@@ -460,6 +463,9 @@ def main():
             log("проход прерван; при следующем запуске продолжу с места останова")
             break
         log(f"цикл {cycle['cycle']} завершён")
+        if RUN_ONCE:
+            log("RUN_ONCE=1: один проход по списку выполнен, завершаю работу")
+            break
         if continuous and not cycle.get("completed"):
             pass
     log("завершение работы")
