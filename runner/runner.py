@@ -135,6 +135,7 @@ def ensure_mounted(url):
     opts = f"username={SMB_USER},password={SMB_PASS},{SMB_OPTS}"
     if SMB_DOMAIN:
         opts += f",domain={SMB_DOMAIN}"
+    opts += ",ro"
     result = subprocess.run(
         ["mount", "-t", "cifs", url, mount, "-o", opts],
         capture_output=True, text=True,

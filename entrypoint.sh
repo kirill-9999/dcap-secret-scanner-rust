@@ -47,7 +47,7 @@ if [ -n "$SMB_SHARE" ]; then
     SMB_OPTS="${SMB_OPTS:-,noperm,vers=3.0,cache=none}"
     [ -n "$SMB_DOMAIN" ] && SMB_OPTS="$SMB_OPTS,domain=$SMB_DOMAIN"
 
-    MOUNT_ARGS="-o username=${SMB_USER:-},password=$PASS,$SMB_OPTS"
+    MOUNT_ARGS="-o username=${SMB_USER:-},password=$PASS,$SMB_OPTS,ro"
     mount -t cifs "$SMB_SHARE" "$MOUNT" $MOUNT_ARGS
 
     T="${1:-$MOUNT}"
