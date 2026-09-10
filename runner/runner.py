@@ -320,6 +320,9 @@ def scan_resource(url, scan_root, cycle_no, slug):
             time.sleep(1)
         reader.join(timeout=5)
         out = "\n".join(lines) + "\n"
+        if outcome is None and (stop_requested or os.path.exists(STOP_FILE)):
+            log("  stop: прерывание застало уже завершившийся скан — считаю остановом")
+            outcome = "stop"
         if outcome == "stop":
             return None, None
         if outcome == "paused":
@@ -330,6 +333,10 @@ def scan_resource(url, scan_root, cycle_no, slug):
                 return None, None
             log(f"  [{slug}] пауза снята, продолжаю с места останова")
             continue
+        if proc.returncode is not None and proc.returncode < 0:
+            log(f"  [{slug}] скан прерван сигналом (код {proc.returncode}) — считаю остановом, "
+                f"state сохранён, продолжу с места останова")
+            return None, None
         if proc.returncode not in (0, 2):
             raise RuntimeError(f"сканер завершился с кодом {proc.returncode}")
         m = re.search(r"Лог\s*:\s*(\S+)", out)
