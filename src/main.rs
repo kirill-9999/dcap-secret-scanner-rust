@@ -1089,6 +1089,8 @@ fn run_scan(
         let resumed = resumed.clone();
         let shared = shared.clone();
         std::thread::spawn(move || {
+            let mut last = 0usize;
+            let mut last_t = Instant::now();
             while !progress_done.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(3000));
                 if progress_done.load(Ordering::Relaxed) {
@@ -1097,15 +1099,23 @@ fn run_scan(
                 let handled = processed.load(Ordering::Relaxed) + resumed.load(Ordering::Relaxed);
                 let total = produced.load(Ordering::Relaxed) + resumed.load(Ordering::Relaxed);
                 let left = total.saturating_sub(handled);
+                let dt = (Instant::now() - last_t).as_secs_f64();
+                let rate = if dt > 0.0 {
+                    (handled - last) as f64 / dt
+                } else {
+                    0.0
+                };
                 let (wf, err) = {
                     let s = shared.lock().unwrap();
                     (s.flagged_files.len(), s.files_error)
                 };
                 let clean = handled.saturating_sub(wf + err);
                 println!(
-                    "[i] Прогресс: всего {total}, обработано {handled}, осталось {left}, \
+                    "[i] Прогресс: всего {total}, обработано {handled} ({rate:.1}/с), осталось {left}, \
                      с находками {wf}, без находок {clean}, с ошибками {err}"
                 );
+                last = handled;
+                last_t = Instant::now();
             }
         });
     }
