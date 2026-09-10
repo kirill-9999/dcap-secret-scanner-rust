@@ -20,6 +20,12 @@
 
 set -e
 
+# Режим супервайзора: dcap-runner <сканер по списку ресурсов с расписанием>
+if [ "$1" = "runner" ]; then
+    shift
+    exec python3 /app/runner.py "$@"
+fi
+
 MOUNT="${SMB_MOUNT:-/mnt/share}"
 
 if [ -n "$SMB_SHARE" ]; then

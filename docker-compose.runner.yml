@@ -1,0 +1,23 @@
+name: dcap-runner
+
+services:
+  dcap-runner:
+    image: ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest
+    container_name: dcap-runner
+    restart: unless-stopped
+    privileged: true
+    command: ["runner"]
+    environment:
+      TZ: "Europe/Moscow"
+      RESOURCE_LIST: /manager/conf/list.txt
+      SCHEDULE: "${SCHEDULE:-always}"
+      SCAN_LOOP: "${SCAN_LOOP:-0}"
+      SMB_USER: "${SMB_USER:-}"
+      SMB_PASS_FILE: /secret.txt
+      SMB_DOMAIN: "${SMB_DOMAIN:-}"
+      SMB_OPTS: "${SMB_OPTS:-,noperm,vers=3.0,cache=none}"
+      SCAN_THREADS: "${SCAN_THREADS:-4}"
+      SCAN_ARGS: "${SCAN_ARGS:-}"
+    volumes:
+      - ./manager:/manager
+      - ./secrets/password.txt:/secret.txt:ro

@@ -13,10 +13,12 @@ RUN apk add --no-cache \
         cifs-utils \
         dumb-init \
         findutils \
+        python3 \
         ca-certificates \
     && adduser -D -u 1000 scan
 
 COPY --from=builder /app/target/release/dcap-scan /usr/local/bin/dcap-scan
+COPY runner/runner.py /app/runner.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

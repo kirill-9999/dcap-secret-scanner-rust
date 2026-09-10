@@ -843,6 +843,23 @@ fn write_report(
     }
     out.push('\n');
 
+    out.push_str("[НАХОДКИ]\n");
+    if shared.findings.is_empty() {
+        out.push_str("  (нет)\n");
+    } else {
+        for f in &shared.findings {
+            out.push_str(&format!(
+                "  {}:{} :: {} (conf {:.2})\n",
+                f.path, f.line_number, f.subcategory, f.confidence
+            ));
+            out.push_str(&format!("      value: {}\n", f.value));
+            if !f.context.is_empty() {
+                out.push_str(&format!("      context: {}\n", f.context));
+            }
+        }
+    }
+    out.push('\n');
+
     out.push_str("[НЕ УДАЛОСЬ ОБРАБОТАТЬ]\n");
     if shared.failures.is_empty() {
         out.push_str("  (нет)\n");
