@@ -1,335 +1,307 @@
 # dcap-secret-scanner (Rust)
 
-Сканер папок на наличие паролей и SSH-ключей. Полнофункциональный порт
-`scan_folder.py` на Rust — потоковый, с большим набором regex-правил под
-.NET/Java/Kafka/Redis/k8s/AD-стек, поддержкой Office-файлов (doc/xls/docx/xlsx)
-и чтения текста в utf-8/cp1251. Собран как отдельный бинарник и как Docker-образ.
+Сканер папок на наличие паролей и SSH-ключей (аналог `scan_folder.py`).
+Regex-правила для .NET/Java/Kafka/Redis/k8s/AD-стека, чтение Office-файлов
+(doc/xls/docx/xlsx), utf-8/cp1251. Распространяется как Docker-образ.
 
-## Сборка бинарника
+## Запуск в Docker
 
-Нужен Rust-тулчейн с настроенным линкером (MSVC Build Tools или GNU/MinGW):
-
-```powershell
-cargo build --release
-```
-
-Бинарь: `target/release/dcap-scan.exe`
-
-## Использование
-
-```text
-dcap-scan <папка> <лог-файл|папка> [потоков] [--no-sniff] [--encoding enc] [--state <файл>] [-v]
-          [--min-entropy N] [--min-length N] [--confidence-threshold N]
-          [--no-generic] [--require-mixed] [--strict-filter] [--presidio]
-```
-
-Примеры:
+### Получение образа
 
 ```powershell
-.\target\release\dcap-scan.exe "Z:\test_files" "e:\Temp\logs" 10
-.\target\release\dcap-scan.exe "C:\src" .\out.log 8 --no-sniff
-.\target\release\dcap-scan.exe "C:\src" .\out.log 8 --state .\state.tsv
-.\target\release\dcap-scan.exe "C:\src" .\out.log 8 --no-generic --strict-filter
+docker pull ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest
 ```
 
-Код возврата: `0` = чисто, `1` = ошибка, `2` = найдены секреты.
+### Два режима
 
-## Управление ложными срабатываниями
+Образ поддерживает два режима:
 
-Сканер уже фильтрует «не-секреты» по значению (плейсхолдеры `your_*`, `example`,
-`changeme`, строки вида `NNN=...`, вызовы команд PowerShell), а также пропускает
-находки на строках-комментариях (`#`, `//`, `;`, `*`, `--`, `<!--`, `!`). Есть
-специальные правила `JWT_SECRET` и `OAUTH_CLIENT_SECRET`. Для сложных случаев
-пороги настраиваются флагами:
+1. **Разовый скан** — одна папка или одна SMB-шара (entrypoint сканера).
+2. **Runner** — периодический или одноразовый скан по списку ресурсов
+   с расписанием, возобновлением, паузой и единым логом находок.
 
-| Флаг | По умолчанию | Что делает |
-|------|--------------|------------|
-| `--min-entropy N` | `3.0` | Минимальная энтропия Шеннона значения (бит/символ). Работает только на правилах с `entropy_check=true`. Ниже порога — находка отбрасывается. |
-| `--min-length N` | `4` | Минимальная длина значения (применяется ко всем правилам). |
-| `--confidence-threshold N` | `0` | Отбрасывает находки правил с уверенностью ниже N (0..1). |
-| `--no-generic` | выкл | Отключает шумные правила `GENERIC_SECRET` и `GENERIC_TOKEN`. |
-| `--require-mixed` | выкл | Значение должно быть длиной ≥ 8 и содержать ≥3 из 4 категорий символов (верхний/нижний регистр, цифры, спецсимволы). Только для правил «секрет по имени». |
-| `--strict-filter` | выкл | Экстра-фильтр плейсхолдеров: `password123`, `example_123`, `simple_name`, значения короче 6 символов. |
+---
 
-Примеры для шумных деревьев (docs, схемы, локализации):
+### Режим 1: разовый скан
+
+#### Локальная папка (bind-mount)
 
 ```powershell
-.\dcap-scan.exe "C:\docs" out.log 8 --no-generic --strict-filter
-.\dcap-scan.exe "C:\src"  out.log 8 --min-entropy 3.2 --no-generic
-.\dcap-scan.exe "C:\src"  out.log 8 --confidence-threshold 0.86
+docker run --rm -v "D:\local\data:/data" `
+  ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest /data /out.log 8
 ```
 
-> Внимание: все флаги — фильтры-«убийцы» (снижают число находок). Они могут
-> скрыть и настоящие секреты. Проверенные отсевы на эталонном наборе:
-> `--no-generic` 39→30, `--require-mixed` 39→33, `--min-length 8` 39→38,
-> `--min-entropy 3.5` 39→26, `--confidence-threshold 0.86` 39→15.
+Аргументы сканера: `<путь_к_папке> <лог-файл или папка> [потоков] [флаги]`.
+Если третий аргумент — папка, отчёт сохраняется в неё автоматически.
 
-## Лог-отчёт
-
-Значения секретов в лог **записываются** (удобно разбирать шум и ложные
-срабатывания):
-
-```text
-[ФАЙЛЫ С НАХОДКАМИ]
-  D:\test_files\config.py
-    CRED_API_KEY, CRED_PASSWORD
-[НАХОДКИ]
-  D:\test_files\config.py:12 :: CRED_PASSWORD (conf 0.75)
-      value: SuperSecret1!
-      context: db_password=SuperSecret1!
-[НЕ УДАЛОСЬ ОБРАБОТАТЬ]
-  D:\test_files\broken.docx :: не удалось извлечь текст (...)
-```
-
-В state-файл секреты по-прежнему не попадают (только пути, типы и причины ошибок).
-
-## State (возобновление после прерывания)
-
-`--state <файл>` сохраняет выполненную работу в отдельный файл. При повторном
-запуске с тем же файлом уже обработанные файлы пропускаются, а отчёт собирается
-из старых и новых данных. Секреты в state тоже не попадают (только пути, типы и
-причины ошибок). Для другого `# folder:` state автоматически сбрасывается.
-
-## Docker: сканирование сетевого диска (Z: / SMB-шары)
-
-Проблема: Docker Desktop на Windows/Mac **не отдаёт** сетевые диски (Z:) в
-контейнер при bind-mount (папка «не найдена»). Решение: контейнер маунтит SMB-шару
-сам через `mount.cifs` внутри себя.
-
-### Сборка образа
-
-```powershell
-docker build -t dcap-scan .
-```
-
-### Запуск со сканированием SMB-шары
+#### SMB-шара (одиночный CIFS, учётка + домен + пароль в файле)
 
 ```powershell
 docker run --rm --privileged `
-  -e SMB_SHARE="//mynas/MainStorage" `
-  -e SMB_USER="mynas\username" `
-  -e SMB_PASS="ПАРОЛЬ" `
-  -e "SMB_OPTS=,vers=3.0,noperm,cache=none" `
-  -v "${PWD}\logs:/logs" `
-  dcap-scan /mnt/share /logs 10
-```
-
-- `--privileged` обязателен для `mount.cifs` внутри контейнера.
-- SMB-шары монтируются **read-only** (`ro`) — сканер в них ничего не пишет.
-- Лог пишется в bind-папку `logs` на хосте (это локальная папка, она монтируется нормально).
-- Пароль безопаснее передать через файл:
-  ```powershell
-  # password.txt в локальной папке, не коммитить!
-  docker run --rm --privileged `
-    -e SMB_SHARE="//mynas/MainStorage" `
-    -e SMB_USER="mynas\username" `
-    -e SMB_PASS_FILE="/secret.txt" `
-    -v "D:\secrets\password.txt:/secret.txt:ro" `
-    -v "${PWD}\logs:/logs" `
-    dcap-scan /mnt/share /logs 10
-  ```
-
-### Сканирование обычной bind-mounted папки (без SMB)
-
-```powershell
-docker run --rm -v "D:\local\data:/data" dcap-scan /data /out.log 8
-```
-
-### Docker Compose (рекомендуется для SMB)
-
-1. Создайте `docker-compose.yml` (готов) и настроение окружения:
-   ```powershell
-   Copy-Item .env.example .env
-   # заполните SMB_SHARE, SMB_USER и пароль (SMB_PASS или secrets/password.txt)
-   ```
-2. Запуск SMB-сканирования:
-   ```powershell
-   docker compose up --build
-   ```
-3. Сканирование локальной bind-mounted папки (без SMB):
-   ```powershell
-   docker compose run --rm -v "D:\local\data:/data" dcap-scan /data /logs 10
-   ```
-
-- `SMB_MOUNT` из `.env` меняет точку монтирования (по умолч. `/mnt/share`); команда сканера по умолчанию — `/mnt/share /logs 10`.
-- Отчёты пишутся в `./logs`, пароль — `./secrets/password.txt` (папки в `.gitignore`).
-- Лучше не оставлять пароль в `.env` на общем диске — используйте файл `secrets/password.txt`.
-- Корректное завершение — после `docker compose up` Ctrl+C, либо `--rm` у `run` убирает контейнер.
-
-## Супервайзер `runner`: периодический скан списка ресурсов
-
-Сканирует по списку сетевых ресурсов с расписанием, паузой, возобновлением и
-единым логом находок. Реализован в `runner/runner.py` (в образе — `/app/runner.py`).
-
-### Запуск
-
-```powershell
-docker run -d --name dcap-runner --privileged `
-  -v "D:\dcap\manager:/manager" `
-  -v "D:\dcap\secret.txt:/secret.txt:ro" `
-  -e RESOURCE_LIST=/manager/conf/list.txt `
-  -e SCHEDULE="01:00-06:00;12:00-13:00" `
-  -e SMB_USER="mynas\user" `
+  -e SMB_SHARE="//fileserver-01.corp/Платежи" `
+  -e SMB_USER="svc-scan" `
+  -e SMB_DOMAIN=CORP `
   -e SMB_PASS_FILE=/secret.txt `
-  ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest runner
+  -v "D:\secrets\password.txt:/secret.txt:ro" `
+  -v "D:\logs:/logs" `
+  ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest /logs 10
 ```
 
-### Список ресурсов
+- `--privileged` обязателен — контейнер сам выполняет `mount.cifs`.
+- Шара монтируется в `/mnt/share` (точка настраивается через `SMB_MOUNT`).
+- Опция `ro` (read-only) добавляется автоматически — сканер ничего не пишет.
+- Домен (`SMB_DOMAIN`) необязателен, если домен уже включён в `SMB_USER`
+  в виде `DOMAIN\user`.
 
-`RESOURCE_LIST` (по умолчанию `/manager/conf/list.txt`) — по одному ресурсу на
-строку; строки с `#` — комментарии. Строка, начинающаяся с `//` или `\\` —
-SMB-шара (маунтится в `MOUNT_ROOT/<slug>`); обычный путь (например bind-mounted
-папка) считается уже доступным каталогом и сканируется как есть. Имена с
-пробелами, слэшами и кириллицей допустимы — вся строка это один ресурс.
+---
 
+### Режим 2: runner (скан списка ресурсов)
+
+#### 1. Подготовка
+
+```powershell
+# Каталог состояния (переживает перезапуски контейнера)
+New-Item -ItemType Directory D:\dcap\manager\conf -Force
+
+# Файл пароля (НЕ коммитить в git)
+Set-Content -Path "D:\dcap\password.txt" -Value "P@ssw0rd!" -NoNewline
 ```
-# примеры ресурсов: две SMB-шары и обычный каталог
+
+Список ресурсов (`conf/list.txt`) — по одному ресурсу на строку:
+
+```text
+# SMB-шары (начинаются с // или \\):
 //fileserver-01.corp/Платежи
 //fileserver-01.corp/Кадры
+//fileserver-02.corp/Архив
+# Обычный bind-mount или локальный каталог:
 /tmp/shares/backup-архив
 ```
 
-### Структура `/manager` (персистентный volume)
+#### 2. Одноразовый прогон (RUN_ONCE)
+
+Выполнит один полный проход по всем ресурсам из списка и завершится.
+Прерванный проход при перезапуске дочитывается с места останова.
+
+```powershell
+docker run -d --name dcap-runner --privileged `
+  -e "TZ=Europe/Moscow" `
+  -e RESOURCE_LIST=/manager/conf/list.txt `
+  -e RUN_ONCE=1 `
+  -e SMB_USER="svc-scan" `
+  -e SMB_DOMAIN=CORP `
+  -e SMB_PASS_FILE=/secret.txt `
+  -e "SCAN_ARGS=--no-generic --strict-filter" `
+  -v "D:\dcap\manager:/manager" `
+  -v "D:\dcap\password.txt:/secret.txt:ro" `
+  ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest runner
+```
+
+Проверка хода работ и результата:
+
+```powershell
+docker logs -f dcap-runner              # консольный вывод
+Get-Content D:\dcap\manager\cycle.json  # статусы ресурсов
+Get-Content D:\dcap\manager\unified.log # единый лог находок
+```
+
+Для повторного прогона — удалите контейнер и запустите снова (state и
+cycle.json хранятся в `D:\dcap\manager` и переживают перезапуск).
+
+#### 3. Запуск с расписанием (долгосрочный режим)
+
+```powershell
+docker run -d --name dcap-runner --restart unless-stopped --privileged `
+  -e "TZ=Europe/Moscow" `
+  -e RESOURCE_LIST=/manager/conf/list.txt `
+  -e SCHEDULE="01:00-06:00;12:00-13:00" `
+  -e SMB_USER="svc-scan" `
+  -e SMB_DOMAIN=CORP `
+  -e SMB_PASS_FILE=/secret.txt `
+  -v "D:\dcap\manager:/manager" `
+  -v "D:\dcap\password.txt:/secret.txt:ro" `
+  ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest runner
+```
+
+#### Структура каталога `manager`
 
 | Путь | Назначение |
 |------|------------|
-| `conf/list.txt` | список ресурсов |
-| `state/<slug>.c<N>.tsv` | состояние прохода по ресурсу (продолжение с места останова) |
-| `report/<slug>.c<N>.log` | полный отчёт сканера по ресурсу (с `[НАХОДКИ]`) |
-| `unified.log` | единый лог находок |
-| `cycle.json` | текущий проход: номер цикла, статусы ресурсов |
-| `control/pause` | `touch` → пауза после текущего файла; `rm` → продолжить |
-| `control/stop` | `touch` → прервать проход и завершить процесс; при следующем старте снимается |
+| `conf/list.txt` | Список ресурсов (см. выше). |
+| `state/<slug>.c<N>.tsv` | Состояние сканирования файла (для resume). Хранит пути, но **не** секреты. |
+| `report/<slug>.c<N>.log` | Полный отчёт сканера по ресурсу (включает найденные значения). |
+| `unified.log` | Единый лог находок всех ресурсов (TSV: время, ресурс, путь, категория, значение и т.д.). |
+| `cycle.json` | Номер текущего цикла и статусы ресурсов (`done`/`error`). |
+| `control/pause` | `touch` — пауза после текущего файла; `rm` — возобновить. |
+| `control/stop` | `touch` — прервать проход и завершить процесс. Одноразовый — удаляется автоматически. |
 
-Формат `unified.log` — одна находка строкой:
-`<время>\t<ресурс>\t<отн.путь>:<строка>\t<подкатегория>\t<уверенность>\t<значение>\t<контекст>`
+`<slug>` — безопасное для файловой системы имя ресурса (автоматически из URL).
+`<N>` — номер цикла из `cycle.json`.
 
-### Поведение
+#### Поведение
 
-- **Цикл** = полный проход по списку. Прерванный (stop/падение) проход при
-  следующем запуске дочитывается с места останова (по `state/*.tsv` и `cycle.json`);
-  завершённые в нём ресурсы не перечитываются. Новый цикл — всегда полная вычитка.
-- **Пауза**: `control/pause` останавливает скан после текущего файла (state
-  сохраняется), `rm control/pause` возобновляет; `docker stop`/SIGTERM ведёт себя
-  как `control/stop`.
-- **Расписание**: `SCHEDULE` — окна `HH:MM-HH:MM;...` (в часовом поясе контейнера,
-  задаётся через `TZ`); поддерживаются окна через полночь. `always`/пусто — пока
-  не остановят. По умолчанию `SCAN_LOOP=0`: один полный проход за окно;
-  `SCAN_LOOP=1` повторяет проходы в течение окна. По завершении ресурса его
-  итоги агрегируются в `unified.log`.
-- **Один проход и выход**: `RUN_ONCE=1` — после полного прохода по списку процесс
-  завершается (удобно для разовых запусков/по cron); прерванный проход сначала
-  дочитывается с места останова, затем работа завершается.
-- **Креды**: `SMB_USER`/`SMB_PASS`/`SMB_PASS_FILE`/`SMB_DOMAIN`/`SMB_OPTS` — общие
-  для всех SMB-ресурсов списка.
-- **Консольный вывод** (`docker logs`): перед сканированием каждого ресурса —
-  `ресурс i/N: <url>` и после его завершения — `обработано ресурсов X/N, осталось N-X`.
-  Сам сканер каждые 3 с печатает `[i] Прогресс: всего ..., обработано ... (N/с), осталось ...,
-  с находками ..., без находок ..., с ошибками ...` (runner транслирует эти строки с
-  префиксом `[<slug>]`), а по завершении ресурса — `[i] Итого по ресурсу: файлов ... (N/с),
-  с находками ..., без находок ..., с ошибками ..., пропущено ...`. После каждого ресурса
-  печатается накопленное `итого по проходу` по всем обработанным в проходе ресурсам
-  (со средней скоростью), а по каждому ресурсу — `готово: файлов ..., находок ... (N/с)`.
-- Уже смонтированные точки проверяются через `/proc/self/mounts` и не
-  перемонтируются; чужая точка перемонтируется. Шара, смонтированная в этом
-  проходе, размонтируется сразу после сканирования ресурса; те, что были
-  смонтированы до старта, не трогаются.
-- Все SMB-ресурсы маунтятся **только для чтения** (опция `ro`, добавляется всегда)
-  — сканер их не изменяет; записи идут только в `manager` (state/report/unified.log).
+- **Цикл** — полный проход по списку. Прерванный при следующем запуске
+  дочитывается с места останова (`state/*.tsv` + `cycle.json`); завершённые
+  ресурсы не перечитываются. Новый цикл начинается всегда с начала.
+- **Resume** — при `RUN_ONCE=1` или при перезапуске `docker start`.
+  Прерванный ресурс продолжается там же, где остановился сканер.
+- **Пауза** — `touch control/pause`; `rm` — возобновить.
+  `docker stop` / SIGTERM ведёт себя как `control/stop`.
+- **Один проход** — `RUN_ONCE=1`. После полного прохода — выход `exit 0`.
+  Прерванный проход дочитывается, затем завершение.
+- **Расписание** — `SCHEDULE` (см. таблицу ниже). По умолчанию `always`.
+- **Креды** — `SMB_USER` / `SMB_PASS` / `SMB_PASS_FILE` / `SMB_DOMAIN`
+  общие для всех SMB-ресурсов из списка.
+- **Auto-unmount** — SMB-шара, смонтированная runner в этом проходе,
+  размонтируется сразу после сканирования ресурса. Точки, смонтированные
+  до старта runner, не трогаются.
+- **Read-only** — все SMB-шары монтируются с `ro`; записи идут только
+  в каталог `manager`.
 
-### Быстрый старт: запуск, останов, расписание
+#### Консольный вывод (`docker logs`)
 
-1. Подготовьте каталог `manager` — всё состояние runner лежит в нём и
-   переживает перезапуски:
+```text
+новый цикл 1; ресурсов: 3
+  ресурс 1/3: //fileserver-01.corp/Платежи
+    [slug_1] //fileserver-01.corp/Платежи -> /mnt/shares/slug_1 (смонтирован сейчас)
+    [slug_1] [i] Прогресс: всего 1234, обработано 1000 (850.2/с), осталось 234, ...
+    [slug_1] [i] Итого по ресурсу: файлов 1234 (912.5/с), с находками 1, ...
+    [slug_1] готово: файлов 1234, находок 1 (880.2/с)
+  обработано ресурсов 1/3, осталось 2
+  итого по проходу: файлов 1234 (850.0/с), с находками 1, ...
+  ресурс 2/3: //fileserver-01.corp/Кадры
+    [slug_2] ...
+  ...
+  итог прохода: ресурсов 3, файлов 6500 (720.3/с), с находками 4, ...
+цикл 1 завершён
+```
 
-   ```powershell
-   New-Item -ItemType Directory D:\dcap\manager\conf
-   # в D:\dcap\manager\conf\list.txt — по одному ресурсу на строку (см. выше)
-   ```
+#### Управление (файлы `control/` в `manager`)
 
-2. Запуск (окно 01:00–06:00, все SMB-шары из списка, креды общие через файл):
+| Действие | Команда (Windows-хост) |
+|----------|------------------------|
+| Пауза после текущего файла | `New-Item -ItemType File D:\dcap\manager\control\pause` |
+| Возобновить (с места останова) | `Remove-Item D:\dcap\manager\control\pause` |
+| Прервать проход и завершить | `New-Item -ItemType File D:\dcap\manager\control\stop` или `docker stop dcap-runner` |
+| Остановить навсегда | `docker stop dcap-runner && docker rm dcap-runner` |
+| Перезапуск (дочитка прерванного) | `docker start dcap-runner` (тот же `-v manager`) |
 
-   ```powershell
-   docker run -d --name dcap-runner --restart unless-stopped --privileged `
-     -e "TZ=Europe/Moscow" `
-     -e RESOURCE_LIST=/manager/conf/list.txt `
-     -e SCHEDULE="01:00-06:00" `
-     -e SMB_USER="mynas\user" `
-     -e SMB_PASS_FILE=/secret.txt `
-     -e SMB_DOMAIN=MYNAS `
-     -v "D:\dcap\manager:/manager" `
-     -v "D:\dcap\secret.txt:/secret.txt:ro" `
-     ghcr.io/kirill-9999/dcap-secret-scanner-rust:latest runner
-   ```
+#### Docker Compose (runner)
 
-   Или через compose (готовый `docker-compose.runner.yml`, пароль в
-   `./secrets/password.txt`, окружение — из `.env`):
+В репозитории есть `docker-compose.runner.yml`:
 
-   ```powershell
-   docker compose -f docker-compose.runner.yml up -d
-   ```
+```powershell
+# Файлы создаются в папке, где лежит docker-compose.runner.yml:
+New-Item -ItemType Directory .\manager\conf, .\secrets -Force
+# .\manager\conf\list.txt — список ресурсов (см. выше)
+# .\secrets\password.txt — пароль (НЕ коммитить)
+Set-Content -Path ".\secrets\password.txt" -Value "P@ssw0rd!" -NoNewline
+# .env рядом с docker-compose.runner.yml:
+@"
+SCHEDULE=01:00-06:00
+SMB_USER=svc-scan
+SMB_DOMAIN=CORP
+SCAN_THREADS=4
+SCAN_ARGS=--no-generic
+"@ | Set-Content -Path ".env" -Encoding utf8
+# Запуск:
+docker compose -f docker-compose.runner.yml up -d
+docker compose -f docker-compose.runner.yml logs -f
+```
 
-3. Что происходит дальше:
+Volume-ы монтируются автоматически (относительно папки с compose-файлом):
+`./manager:/manager` (состояние) и `./secrets/password.txt:/secret.txt:ro`
+(пароль, read-only).
 
-   - `docker logs -f dcap-runner` — ход работ: старт цикла, ресурсы, находки, паузы;
-   - `D:\dcap\manager\unified.log` — единый лог всех находок (путь, подкатегория, значение);
-   - `D:\dcap\manager\cycle.json` — текущий проход и статусы ресурсов.
+---
 
-4. Останов и пауза (файлы `control/` в `manager` создаются пустыми):
+## Переменные окружения
 
-   | Действие | Действие (Windows-хост) |
-   |----------|--------------------------|
-   | Пауза после текущего файла | `New-Item -ItemType File D:\dcap\manager\control\pause` |
-   | Возобновить (с места останова) | `Remove-Item D:\dcap\manager\control\pause` |
-   | Прервать проход и завершить процесс | `New-Item -ItemType File D:\dcap\manager\control\stop` (или `docker stop dcap-runner`) |
-   | Остановить вовсе | `docker stop dcap-runner` + `docker rm dcap-runner` |
-   | Перезапуск (дочитка прерванного прохода) | `docker start dcap-runner` (тот же `-v manager`) |
+### Переменные entrypoint (разовый скан)
 
-   `control/stop` одноразовый — при следующем старте супервайзор удаляет его сам.
+| Переменная | По умолчанию | Описание |
+|------------|--------------|----------|
+| `SMB_SHARE` | *(пусто)* | Путь к SMB-шаре, например `//fileserver-01.corp/Share`. Если задана — entrypoint маунтит шару через `mount.cifs` и сканирует её. Если пуста — сканирует путь из первого аргумента командной строки (bind-mount / локальная папка). |
+| `SMB_USER` | *(пусто)* | Учётная запись для CIFS-аутентификации. Формат: `user` или `DOMAIN\user` (домен в имени). Передаётся как `username=...` в `mount.cifs`. |
+| `SMB_DOMAIN` | *(пусто)* | Домен / WORKGROUP для AD. Добавляет опцию `domain=...`. Необязательно, если домен уже включён в `SMB_USER` (формат `DOMAIN\user`). |
+| `SMB_PASS` | *(пусто)* | Пароль напрямую. Виден в `docker inspect` — для продакшена используйте `SMB_PASS_FILE`. Альтернатива файлу; если заданы оба — приоритет у `SMB_PASS_FILE`. |
+| `SMB_PASS_FILE` | *(пусто)* | Путь внутри контейнера к текстовому файлу с паролем (пробелы/переводы строк обрезаются). Пример: `-v "D:\secrets\password.txt:/secret.txt:ro" -e SMB_PASS_FILE=/secret.txt`. |
+| `SMB_OPTS` | `,noperm,vers=3.0,cache=none` | Дополнительные опции `mount.cifs`. `vers=3.0` — версия протокола SMB (задайте `2.0`, если NAS не поддерживает 3.x); `cache=none` — без кеширования (актуальность данных); `noperm` — без проверки прав Linux. Опция `ro` добавляется автоматически. |
+| `SMB_MOUNT` | `/mnt/share` | Точка монтирования шары внутри контейнера. При сканировании используется как первый аргумент сканера (по умолчанию). |
 
-5. Расписание — переменная `SCHEDULE`:
+**Важно:** для `mount.cifs` контейнер должен быть запущен с флагом `--privileged`.
 
-   | Значение | Поведение |
-   |----------|-----------|
-   | `SCHEDULE="01:00-06:00"` | работать только 01:00–06:00 |
-   | `SCHEDULE="01:00-06:00;12:00-13:00"` | несколько окон через `;` |
-   | `SCHEDULE="23:00-01:00"` | окно через полночь |
-   | `SCHEDULE=always` (по умолч.) | работает, пока не остановят |
+### Переменные супервайзера runner
 
-   Время берётся в часовом поясе контейнера (по умолчанию UTC; добавьте
-   `-e "TZ=Europe/Moscow"`, чтобы окна были по Москве). `SCAN_LOOP=1` —
-   повторять полные проходы внутри окна; по умолчанию `0` — один проход
-   за окно, затем ожидание следующего.
+Запускаются командой: `docker run ... ghcr.io/...:latest runner`.
 
-## Переменные окружения (entrypoint)
+| Переменная | По умолчанию | Описание |
+|------------|--------------|----------|
+| `RESOURCE_LIST` | `<MANAGER_DIR>/conf/list.txt` | Текстовый файл со списком ресурсов. По одному на строку; `#` — комментарии; строки с `//` или `\\` — SMB-шары (маунтятся runner'ом); обычные пути — доступные локальные/bind-каталоги. Кириллица и пробелы допустимы. |
+| `MANAGER_DIR` | `/manager` | Корневой каталог состояния. Должен быть примонтирован как persist-volume (содержит `state/`, `report/`, `cycle.json`, `unified.log`). |
+| `MOUNT_ROOT` | `/mnt/shares` | Корень точек монтирования SMB. Каждая шара получает подкаталог `<MOUNT_ROOT>/<slug>`. |
+| `SCHEDULE` | `always` | Расписание работы (см. таблицу ниже). Время берётся в часовом поясе контейнера (`TZ`). |
+| `SCAN_LOOP` | `0` | `0` — один проход за окно; `1` — повторять проходы непрерывно в течение окна. |
+| `RUN_ONCE` | `0` | `1` — после одного полного прохода по списку завершиться с кодом `0`. Прерванный проход дочитывается, затем выход. Удобно для cron / одноразовых запусков. |
+| `UNIFIED_LOG` | `<MANAGER_DIR>/unified.log` | Единый лог находок (TSV). |
+| `SCANNER` | `/usr/local/bin/dcap-scan` | Путь к бинарнику сканера внутри образа. |
+| `SCAN_THREADS` | `4` | Количество потоков (параллельных file-walkers) на каждый ресурс. |
+| `SCAN_ARGS` | *(пусто)* | Дополнительные флаги сканера через пробел (см. таблицу флагов ниже). Пример: `--no-generic --strict-filter --min-entropy 3.2`. |
+| `TZ` | `UTC` | Часовой пояс контейнера для `SCHEDULE`. Примеры: `Europe/Moscow`, `UTC`. |
 
-| Переменная     | Назначение                                        |
-|----------------|---------------------------------------------------|
-| `SMB_SHARE`    | SMB-шара, напр. `//mynas/MainStorage`             |
-| `SMB_USER`     | пользователь (`mynas\user`)                       |
-| `SMB_PASS`     | пароль (альтернатива файлу)                       |
-| `SMB_PASS_FILE`| путь в контейнере к файлу с паролем               |
-| `SMB_DOMAIN`   | домен AD для cifs (опция `domain=`), напр. `MYNAS`; необязательно |
-| `SMB_MOUNT`    | точка монтирования (по умолч. `/mnt/share`)         |
-| `SMB_OPTS`     | доп. опции cifs, напр. `,vers=3.0,noperm,cache=none` |
+#### Расписание (SCHEDULE)
 
-Переменные супервайзора `runner` (`docker run ... dcap-scan runner`):
+| Формат | Поведение |
+|--------|-----------|
+| `always` *(по умолчанию)* | Работает, пока не остановят. |
+| `01:00-06:00` | Работает только в окне 01:00–06:00. |
+| `01:00-06:00;12:00-13:00` | Несколько окон через `;`. |
+| `23:00-01:00` | Окно через полночь (работает 23:00–06:00). |
 
-| Переменная        | Назначение                                                        |
-|-------------------|-------------------------------------------------------------------|
-| `RESOURCE_LIST`   | файл со списком ресурсов (по умолч. `<MANAGER_DIR>/conf/list.txt`)|
-| `MANAGER_DIR`     | рабочий каталог с состоянием (по умолч. `/manager`)               |
-| `MOUNT_ROOT`      | корень точек монтирования SMB (по умолч. `/mnt/shares`)           |
-| `SCHEDULE`        | окна работы `HH:MM-HH:MM;...` или `always` (по умолч. `always`)   |
-| `SCAN_LOOP`       | `1` — повторять проходы в течение окна (по умолч. `0`)            |
-| `RUN_ONCE`        | `1` — один полный проход по списку, затем выход (по умолч. `0`)   |
-| `UNIFIED_LOG`     | единый лог (по умолч. `<MANAGER_DIR>/unified.log`)                |
-| `SCANNER`         | путь к сканеру (по умолч. `/usr/local/bin/dcap-scan`)             |
-| `SCAN_THREADS`    | потоков на ресурс (по умолч. `4`)                                 |
-| `SCAN_ARGS`       | доп. флаги сканера через пробел (напр. `--no-generic --strict-filter`)|
+### Флаги сканера (для SCAN_ARGS)
+
+Флаги управляют фильтрацией находок и снижают шум. **Все — фильтры-«убийцы»:**
+могут скрыть и настоящие секреты. Используйте для шумных деревьев
+(документация, локализации, схемы).
+
+| Флаг | По умолчанию | Описание |
+|------|--------------|----------|
+| `--min-entropy N` | `3.0` | Минимальная энтропия Шеннона значения (бит/символ). Действует только на правилах с `entropy_check=true` — оценивает «случайность» значения по соотношению уникальных символов к длине. |
+| `--min-length N` | `4` | Минимальная длина значения (применяется ко всем правилам). |
+| `--confidence-threshold N` | `0` | Отбрасывает находки правил с confidence ниже N. Confidence задаётся статически для каждого правила (0.70–0.99); рантайм-оценка значения не входит. |
+| `--no-generic` | выкл | Отключает шумные правила `GENERIC_SECRET` и `GENERIC_TOKEN`. |
+| `--require-mixed` | выкл | Требует от значения ≥ 8 символов и ≥ 3 из 4 классов (A–Z, a–z, 0–9, спецсимволы). Только для правил «секрет по имени». |
+| `--strict-filter` | выкл | Экстра-фильтр плейсхолдеров (`password123`, `example_123`), значений < 6 символов, шаблонных имён. |
+
+> Проверенные отсевы на эталонном наборе (39 находок):
+> `--no-generic` → 30, `--require-mixed` → 33, `--min-length 8` → 38,
+> `--min-entropy 3.5` → 26, `--confidence-threshold 0.86` → 15.
+
+---
+
+## Лог-отчёт и state
+
+Значения секретов **записываются в лог-файл** (удобно разбирать шум):
+
+```text
+[ФАЙЛЫ С НАХОДКАМИ]
+  /mnt/shares/slug_1/config.yaml
+    CRED_API_KEY, CRED_PASSWORD
+[НАХОДКИ]
+  /mnt/shares/slug_1/config.yaml:12 :: CRED_PASSWORD (conf 0.75)
+      value: SuperSecret1!
+      context: db_password=SuperSecret1!
+[НЕ УДАЛОСЬ ОБРАБОТАТЬ]
+  /mnt/shares/slug_1/broken.docx :: не удалось извлечь текст (...)
+```
+
+**State-файл** (`state/<slug>.c<N>.tsv`) хранит только пути, типы файлов
+и причины ошибок — секреты **не попадают** ни в state, ни в `cycle.json`.
+При повторном запуске с тем же циклом уже обработанные файлы пропускаются.
 
 ## Паритет с Python-сканером
 
-Паритет по находкам с `scan_folder.py` подтверждён на `test_scan_tree` (1175) и
-синтетике новых паттернов (39). На корпусе ложных срабатываний (локализации,
-документация, PowerCLI-скрипт) — 0 находок при сохранении эталона.
+Паритет по находкам с `scan_folder.py` подтверждён на `test_scan_tree`
+(1175 файлов) и синтетике новых паттернов (39). На корпусе ложных
+срабатываний (локализации, документация, PowerCLI-скрипт) — 0 находок
+при сохранении эталона.
